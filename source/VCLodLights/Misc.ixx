@@ -308,6 +308,11 @@ export namespace CGeneral
 
     int32_t GetRandomNumberInRange(int32_t low, int32_t high)
     {
-        return low + (high - low) * (CGeneral::GetRandomNumber() / float(MYRAND_MAX + 1));
+        // Compute in double to avoid signed 32-bit overflow in (high - low).
+        // Conversion back to int is deliberate; the result lies between the endpoints.
+        const double fraction = CGeneral::GetRandomNumber() / double(MYRAND_MAX + 1);
+        const double result = static_cast<double>(low) +
+                              (static_cast<double>(high) - static_cast<double>(low)) * fraction;
+        return static_cast<int32_t>(result);
     }
 }

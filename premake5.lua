@@ -79,11 +79,15 @@ workspace "III.VC.SA.IV.Project2DFX"
    local build = os.date("%Y")
    local revision = os.date("%H") .. os.date("%M")
 
+   -- ZIP distributions do not contain .git metadata. Avoid probing Git for a
+   -- commit ID in that case (and avoid a noisy "not a git repository" warning).
    local githash = ""
-   local f = io.popen("git rev-parse --short HEAD")
-   if f then
-      githash = f:read("*a"):gsub("%s+", "")
-      f:close()
+   if os.isdir(path.join(_SCRIPT_DIR, ".git")) or os.isfile(path.join(_SCRIPT_DIR, ".git")) then
+      local f = io.popen("git rev-parse --short HEAD")
+      if f then
+         githash = f:read("*a"):gsub("%s+", "")
+         f:close()
+      end
    end
 
    local productVersion = major .. "." .. minor .. "." .. build .. "." .. revision
@@ -148,6 +152,7 @@ project "IIILodLights"
 project "VCLodLights"
    setpaths("GRAND_THEFT_AUTO_VICE_CITY_DIR", "gta-vc.exe")
 project "SALodLights"
+   defines { "PROJECT2DFX_SA=1" }
    setpaths("GTA_SAN_ANDREAS_DIR", "gta_sa.exe")
 project "IVLodLights"
    removefiles { "source/*.hpp", "source/*.ixx" }

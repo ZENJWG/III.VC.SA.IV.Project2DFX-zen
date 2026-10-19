@@ -264,6 +264,8 @@ void RegisterLODLights()
     CVector camPos;
     GetCamPos(currentCamera, &camPos.x, &camPos.y, &camPos.z);
 
+    // All lamps share the same camera far range this frame.
+    const float coronaFarClipSq = fCoronaFarClip * fCoronaFarClip;
     for (const auto& lamppost : m_Lampposts)
     {
         // Check height bounds
@@ -275,14 +277,15 @@ void RegisterLODLights()
         float dy = camPos.y - lamppost.vecPos.y;
         float dz = camPos.z - lamppost.vecPos.z;
         float fDistSqr = dx * dx + dy * dy + dz * dz;
-        float distance = std::sqrt(fDistSqr);
-
         float fCoronaDist = lamppost.fObjectDrawDistance - 30.0f;
 
-        // Check if within corona range
+        // Reject out-of-range lights before sqrt; most map lamps are too far
+        // from the current camera to be submitted to GTA IV's corona renderer.
         if (!lamppost.nNoDistance &&
-            (fDistSqr <= fCoronaDist * fCoronaDist || fDistSqr >= fCoronaFarClip * fCoronaFarClip))
+            (fDistSqr <= fCoronaDist * fCoronaDist || fDistSqr >= coronaFarClipSq))
             continue;
+
+        float distance = std::sqrt(fDistSqr);
 
         // Calculate radius
         float fRadius = lamppost.nNoDistance ? 3.5f :
@@ -448,7 +451,7 @@ extern "C" __declspec(dllexport) void InitializeASI()
     static std::once_flag flag;
     std::call_once(flag, []()
     {
-        CallbackHandler::RegisterCallback(Init, hook::pattern("F3 0F 10 44 24 ? F3 0F 59 05 ? ? ? ? EB ? E8"));
+        CallbackHandler::RegisterCallbackAtGetSystemTimeAsFileTime(Init, hook::pattern("F3 0F 10 44 24 ? F3 0F 59 05 ? ? ? ? EB ? E8"));
     });
 }
 

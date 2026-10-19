@@ -1,9 +1,13 @@
-module;
+﻿module;
 
 #define NOMINMAX
 #include <stdafx.h>
 #include <unordered_map>
 #include "DistantLightLogic.hpp"
+#include "CoronaRenderMath.hpp"
+#ifdef PROJECT2DFX_SA
+#include "SALodLights/GpuD3D9.hpp"
+#endif
 
 export module LODLights;
 
@@ -197,17 +201,34 @@ private:
     {
         RwRaster* m_pRaster;
         std::vector<RwIm2DVertex> m_aVertices;
+#ifdef PROJECT2DFX_SA
+        std::vector<GpuD3D9::LightInstance> m_gpuInstances;
+        bool m_gpuEnabled = false;
+        unsigned m_screenW = 0, m_screenH = 0;
+        void SetGpu(bool enabled, unsigned width, unsigned height) {
+            m_gpuEnabled = enabled;
+            m_screenW = width; m_screenH = height;
+        }
+#endif
 
-        RenderBatch(RwRaster* raster) : m_pRaster(raster) { m_aVertices.reserve(6 * 1024); }
+        RenderBatch(RwRaster* raster) : m_pRaster(raster) { m_aVertices.reserve(6 * 1024);
+#ifdef PROJECT2DFX_SA
+            m_gpuInstances.reserve(GpuD3D9::MAX_LIGHTS);
+#endif
+        }
         RenderBatch() : RenderBatch(nullptr) {}
 
         void Clear()
         {
             m_aVertices.clear();
+#ifdef PROJECT2DFX_SA
+            m_gpuInstances.clear();
+#endif
             m_pRaster = nullptr;
         }
 
-        void AddOneXLUSpriteToBuffer_Rotate_Aspect(float x, float y, float z, float w, float h, uint8_t r, uint8_t g, uint8_t b, int16_t intens, float recipz, float rotation, uint8_t a)
+        void AddOneXLUSpriteToBuffer_Rotate_Aspect(float x, float y, float z, float w, float h, uint8_t r, uint8_t g, uint8_t b, int16_t intens, float recipz, float rotation, uint8_t a,
+                                                   float screenNearZ, float depthNearClip, float depthScale)
         {
             float c = rotation == 0.0f ? 1.0f : cos(rotation);
             float s = rotation == 0.0f ? 0.0f : sin(rotation);
@@ -219,13 +240,34 @@ private:
             {
                 if (z < 1.5f)
                     return;
-                int f = (z - 1.5f) / 1.5f * 255;
+                const int f = static_cast<int>((z - 1.5f) / 1.5f * 255.0f);
                 r = f * r >> 8;
                 g = f * g >> 8;
                 b = f * b >> 8;
                 intens = f * intens >> 8;
             }
 
+#ifdef PROJECT2DFX_SA
+            if (m_gpuEnabled)
+            {
+                // Only conservative bounding-box culling is needed on CPU.
+                // The VS expands all four screen-space corners per instance.
+                const float maxX = std::abs(w) * (std::abs(c) + std::abs(s));
+                const float maxY = std::abs(h) * (std::abs(c) + std::abs(s));
+                if (x+maxX < 0 || y+maxY < 0 ||
+                    x-maxX > RsGlobal->width || y-maxY > RsGlobal->height)
+                    return;
+                if (m_gpuInstances.size() == GpuD3D9::MAX_LIGHTS)
+                    Render();
+                const float screenz = screenNearZ + (z-depthNearClip)*depthScale/z;
+                const uint8_t cr = r*intens >> 8, cg=g*intens >> 8, cb=b*intens >> 8;
+                const uint32_t color = (static_cast<uint32_t>(a)<<24) |
+                    (static_cast<uint32_t>(cr)<<16) |
+                    (static_cast<uint32_t>(cg)<<8) | cb;
+                m_gpuInstances.push_back({x,y,w,h,c,s,screenz,recipz,color});
+                return;
+            }
+#endif
             xs[0] = x + w * (-c - s); ys[0] = y + h * (-c + s); us[0] = 0.0f; vs[0] = 0.0f; // TL
             xs[1] = x + w * (+c - s); ys[1] = y + h * (-c - s); us[1] = 1.0f; vs[1] = 0.0f; // TR
             xs[2] = x + w * (-c + s); ys[2] = y + h * (+c + s); us[2] = 0.0f; vs[2] = 1.0f; // BL
@@ -242,9 +284,10 @@ private:
                 ys[2] > RsGlobal->height && ys[3] > RsGlobal->height)
                 return;
 
-            float screenz = *CSprite::m_f2DNearScreenZ +
-                (z - *CDraw::ms_fNearClipZ) * (*CSprite::m_f2DFarScreenZ - *CSprite::m_f2DNearScreenZ) * *CDraw::ms_fFarClipZ /
-                ((*CDraw::ms_fFarClipZ - *CDraw::ms_fNearClipZ) * z);
+            // The projection constants are stable across this render call.
+            // Hoisting them out of the sprite loop avoids repeated pointer
+            // loads and divisions by the same near/far clip interval.
+            float screenz = screenNearZ + (z - depthNearClip) * depthScale / z;
 
             uint8_t cr = r * intens >> 8;
             uint8_t cg = g * intens >> 8;
@@ -254,6 +297,7 @@ private:
 
             // Bound each draw and retain its storage even at the corona limit.
             // All batches use additive blending with depth writes disabled.
+
             if (m_aVertices.size() == 6 * 1024)
                 Render();
             const size_t base = m_aVertices.size();
@@ -277,12 +321,43 @@ private:
 
         void Render()
         {
-            if (m_aVertices.empty() || m_pRaster == nullptr)
-                return;
-
+            if (m_pRaster == nullptr) return;
+#ifdef PROJECT2DFX_SA
+            if (!m_gpuInstances.empty())
+            {
+                RwRenderStateSet(rwRENDERSTATETEXTURERASTER, m_pRaster);
+                // Instancing buffers have a bounded capacity. Submit large
+                // corona batches in chunks rather than silently falling back
+                // for an entire busy scene once it exceeds that capacity.
+                size_t rendered = 0;
+                while (rendered < m_gpuInstances.size())
+                {
+                    const size_t count = (std::min)(
+                        size_t(GpuD3D9::MAX_LIGHTS), m_gpuInstances.size() - rendered);
+                    if (!GpuD3D9::Instance().DrawLights(m_gpuInstances.data() + rendered,
+                            static_cast<unsigned>(count),m_screenW,m_screenH))
+                        break;
+                    rendered += count;
+                }
+                if (rendered == m_gpuInstances.size())
+                {
+                    m_gpuInstances.clear();
+                    return;
+                }
+                // Shader/device failure: expand only the unrendered tail
+                // into the original RenderWare vertex format.
+                const size_t remaining = m_gpuInstances.size() - rendered;
+                const size_t start = m_aVertices.size();
+                m_aVertices.resize(start + remaining * 6);
+                for (size_t i=0; i<remaining; ++i)
+                    GpuD3D9::ExpandLightCPU(m_gpuInstances[rendered+i],
+                        &m_aVertices[start + i*6]);
+                m_gpuInstances.clear();
+            }
+#endif
+            if (m_aVertices.empty()) return;
             RwRenderStateSet(rwRENDERSTATETEXTURERASTER, m_pRaster);
             RwIm2DRenderPrimitive(rwPRIMTYPETRILIST, m_aVertices.data(), m_aVertices.size());
-
             m_aVertices.clear();
         }
     };
@@ -561,6 +636,11 @@ public:
         const float fogyness = CWeather::Foggyness;
         const float screenWidth = static_cast<float>(nWidth);
         const float screenHeight = static_cast<float>(nHeight);
+        const float depthNearScreenZ = *CSprite::m_f2DNearScreenZ;
+        const float depthNearClip = *CDraw::ms_fNearClipZ;
+        const float depthFarClip = *CDraw::ms_fFarClipZ;
+        const float depthScale = (*CSprite::m_f2DFarScreenZ - depthNearScreenZ) *
+            depthFarClip / (depthFarClip - depthNearClip);
 
         const RwMatrix& viewMatrix = Scene->m_pRwCamera->viewMatrix;
         const float vmRightX = viewMatrix.right.x, vmRightY = viewMatrix.right.y, vmRightZ = viewMatrix.right.z;
@@ -605,8 +685,18 @@ public:
         RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTION, (void*)7); // rwALPHATESTFUNCTIONGREATEREQUAL
         RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTIONREF, (void*)0);
 
+        // Initialize the opt-in GPU path before accumulating sprites.
+        // If SM3.0/compiler are missing we keep the original 6-vertex path.
+#ifdef PROJECT2DFX_SA
+        const bool gpuLights = bGtaSaGpuLightQuads && GpuD3D9::Instance().Ready();
+#endif
         for (auto& batch : m_RenderBatches)
+        {
             batch.Clear();
+#ifdef PROJECT2DFX_SA
+            batch.SetGpu(gpuLights,static_cast<unsigned>(nWidth),static_cast<unsigned>(nHeight));
+#endif
+        }
 
         auto SelectBatch = [](RwRaster* pRaster) -> RenderBatch*
         {
@@ -621,7 +711,13 @@ public:
                     return &batch;
                 }
 
-            return &m_RenderBatches.emplace_back(pRaster);
+            auto& batch = m_RenderBatches.emplace_back(pRaster);
+#ifdef PROJECT2DFX_SA
+            batch.SetGpu(bGtaSaGpuLightQuads && GpuD3D9::Instance().Ready(),
+                static_cast<unsigned>(Scene->m_pRwCamera->frameBuffer->width),
+                static_cast<unsigned>(Scene->m_pRwCamera->frameBuffer->height));
+#endif
+            return &batch;
         };
 
         for (auto pNode = UsedList.First(); pNode && pNode != &UsedList; pNode = pNode->GetNextNode())
@@ -668,17 +764,9 @@ public:
             // Their opacity already includes the model's distance/envelope/fog fade.
             const float fadeFactor = !modelLamp && vecTransformedCoords.z > halfRange ? 1.0f - (vecTransformedCoords.z - halfRange) / halfRange : 1.0f;
             const short fadeIntensity = static_cast<short>(corona.Intensity * fadeFactor);
-
-            RwTexture* pTex = corona.nTexType < 9 ? gpCoronaTexture[corona.nTexType] : nullptr;
-            if (!pTex)
+            // Zero intensity contributes no additive pixels; do not touch a batch.
+            if (fadeIntensity == 0)
                 continue;
-
-            RwRaster* pRaster = RwTextureGetRaster(pTex);
-            if (pLastRaster != pRaster)
-            {
-                pLastRaster = pRaster;
-                pCurRenderBatch = SelectBatch(pRaster);
-            }
 
             const float fColourFogMult = std::min(40.0f, vecTransformedCoords.z) * fogyness * 0.025f + 1.0f;
             if (corona.Identifier == 1)
@@ -726,13 +814,37 @@ public:
                 }
             }
 
+            // The sprite is always axis-aligned (rotation 0). Reject clipped
+            // quads before raster lookup, batch selection, color conversion,
+            // depth conversion, and the six-vertex write. This agrees with
+            // RenderBatch's existing four-corner clipping test.
+            if (CoronaRenderMath::OutsideViewport(
+                    vecTransformedCoords.x, vecTransformedCoords.y,
+                    renderHeight, renderHeight * fColourFogMult,
+                    static_cast<float>(RsGlobal->width), static_cast<float>(RsGlobal->height)))
+                continue;
+
+            RwTexture* pTex = corona.nTexType < 9 ? gpCoronaTexture[corona.nTexType] : nullptr;
+            if (!pTex)
+                continue;
+
+            RwRaster* pRaster = RwTextureGetRaster(pTex);
+            if (!pRaster)
+                continue;
+            if (pLastRaster != pRaster)
+            {
+                pLastRaster = pRaster;
+                pCurRenderBatch = SelectBatch(pRaster);
+            }
+
             pCurRenderBatch->AddOneXLUSpriteToBuffer_Rotate_Aspect(
                 vecTransformedCoords.x, vecTransformedCoords.y, vecTransformedCoords.z,
                 renderHeight, renderHeight * fColourFogMult,
                 static_cast<uint8_t>(static_cast<float>(corona.Red) / fColourFogMult),
                 static_cast<uint8_t>(static_cast<float>(corona.Green) / fColourFogMult),
                 static_cast<uint8_t>(static_cast<float>(corona.Blue) / fColourFogMult),
-                fadeIntensity, invFarClip * 20.0f, 0.0, 0xFF);
+                fadeIntensity, invFarClip * 20.0f, 0.0, 0xFF,
+                depthNearScreenZ, depthNearClip, depthScale);
         }
 
         for (auto& batch : m_RenderBatches)

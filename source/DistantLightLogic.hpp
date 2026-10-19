@@ -13,12 +13,15 @@ namespace DistantLightLogic
     }
     inline uint8_t TrafficPhase(uint32_t time, unsigned group, unsigned divisor)
     {
+        if (divisor == 0) return 2; // Fail safe: no active traffic phase.
         uint32_t phase = (time / divisor) & 16383u;
         if (group == 1) return phase < 5000 ? 0 : phase < 6000 ? 1 : 2;
         return phase < 6000 ? 2 : phase < 11000 ? 0 : phase < 12000 ? 1 : 2;
     }
     inline float Pulse(uint32_t time, uint32_t on, uint32_t off)
     {
+        if (on == 0) return 0.0f;
+        if (off > UINT32_MAX - on) return 0.0f; // Prevent period overflow.
         uint32_t period = on + off;
         // Match IsBlinkingNeeded: one global phase for every light of a mode.
         uint32_t phase = time % period;

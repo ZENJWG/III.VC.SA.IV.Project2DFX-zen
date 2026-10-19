@@ -1,10 +1,13 @@
-module;
+﻿module;
 
 #include <stdafx.h>
 #include <cmath>
 #include <type_traits>
 #include "DistantCarMesh.hpp"
 #include "DistantBoatMesh.hpp"
+#ifdef PROJECT2DFX_SA
+#include "SALodLights/GpuD3D9.hpp"
+#endif
 
 export module DistantCarRenderer;
 
@@ -235,10 +238,68 @@ export namespace DistantCarRenderer
             RenderStates states;
             static DistantCarMesh::Buffer<uint32_t, 10000> batchIds;
             batchIds.clear();
+
+            const float hour = static_cast<float>(CClock::ms_nGameClockHours) +
+                static_cast<float>(CClock::ms_nGameClockMinutes) / 60.0f;
+            const float daylight = Saturate((hour - 5.5f) / 1.5f) *
+                Saturate((20.5f - hour) / 2.0f);
+            const float lamps = (std::max)(1.0f - daylight, static_cast<float>(CWeather::Foggyness) * .8f);
+            const float ambient = fNightAmbient * (1.0f - daylight) + .14f * daylight + daylight * .42f;
+            const float diffuse = daylight * .34f;
+
+#ifdef PROJECT2DFX_SA
+            const bool gpuCars = !bLegacyIm3D && bGtaSaGpuCars && GpuD3D9::Instance().Ready();
+            static DistantCarMesh::Buffer<GpuD3D9::CarVertex, GpuD3D9::MAX_CAR_VERTICES> gpuVertices;
+            static DistantCarMesh::Buffer<uint16_t, GpuD3D9::MAX_CAR_INDICES> gpuIndices;
+            static DistantCarMesh::Buffer<GpuD3D9::CarWorld, GpuD3D9::MAX_CARS_PER_BATCH> gpuWorlds;
+            gpuVertices.clear(); gpuIndices.clear(); gpuWorlds.clear();
+#endif
             auto flush = [&]()
             {
                 bool drawn = false;
-                if (!vertices.empty() && RwIm3DTransform(vertices.data(), static_cast<unsigned int>(vertices.size()), nullptr, transformFlags))
+#ifdef PROJECT2DFX_SA
+                if (gpuCars && !gpuVertices.empty())
+                {
+                    drawn = GpuD3D9::Instance().DrawCars(
+                        gpuVertices.data(),static_cast<unsigned>(gpuVertices.size()),
+                        gpuIndices.data(),static_cast<unsigned>(gpuIndices.size()),
+                        gpuWorlds.data(),static_cast<unsigned>(gpuWorlds.size()),
+                        ambient,diffuse,lamps);
+                    if (!drawn)
+                    {
+                        // Hardware path failed mid-game or during device reset:
+                        // reconstruct legacy Im3D vertices from the *same*
+                        // geometry and per-instance matrices, so no cars vanish.
+                        vertices.clear(); indices.clear();
+                        auto* output = vertices.append(gpuVertices.size());
+                        auto* outIndex = indices.append(gpuIndices.size());
+                        if (output && outIndex)
+                        {
+                            for (const auto& v : gpuVertices)
+                            {
+                                const auto& m = gpuWorlds[static_cast<size_t>(v.transform)].matrix;
+                                auto& dst = *output++;
+                                const auto p=GpuBatchMath::Point(m,{v.x,v.y,v.z});
+                                dst.objVertex={p.x,p.y,p.z};
+                                const auto n=GpuBatchMath::Normal(m,{v.nx,v.ny,v.nz});
+                                dst.objNormal={n.x,n.y,n.z};
+                                dst.u=dst.v=0;
+                                const float power = GpuBatchMath::Light(
+                                    ambient,diffuse,lamps,static_cast<int>(v.material),n);
+                                auto colour = [&](unsigned shift) {
+                                    return static_cast<uint32_t>((std::min)(255,
+                                        static_cast<int>(((v.argb>>shift)&255) * power)));
+                                };
+                                dst.color = (v.argb & 0xFF000000u) |
+                                    (colour(16)<<16) | (colour(8)<<8) | colour(0);
+                            }
+                            for (uint16_t i : gpuIndices) *outIndex++=static_cast<short>(i);
+                        }
+                    }
+                }
+#endif
+                if (!drawn && !vertices.empty() &&
+                    RwIm3DTransform(vertices.data(), static_cast<unsigned>(vertices.size()), nullptr, transformFlags))
                 {
                     drawn = RwIm3DRenderIndexedPrimitive(3, indices.data(), static_cast<int>(indices.size())) != 0;
                     RwIm3DEnd();
@@ -247,11 +308,11 @@ export namespace DistantCarRenderer
                     for (uint32_t id : batchIds) HideLights(id);
                 batchIds.clear();
                 vertices.clear(); indices.clear();
+#ifdef PROJECT2DFX_SA
+                gpuVertices.clear(); gpuIndices.clear(); gpuWorlds.clear();
+#endif
             };
 
-            const float hour = static_cast<float>(CClock::ms_nGameClockHours) + static_cast<float>(CClock::ms_nGameClockMinutes) / 60.0f;
-            const float daylight = Saturate((hour - 5.5f) / 1.5f) * Saturate((20.5f - hour) / 2.0f);
-            const float lamps = (std::max)(1.0f - daylight, static_cast<float>(CWeather::Foggyness) * .8f);
             static constexpr uint8_t paints[][3] = { {175,181,180},{53,61,66},{134,29,25},{30,58,99},
                 {189,178,143},{32,70,53},{203,202,190},{87,82,76},{109,118,134},{172,139,65} };
             for (const auto& car : cars)
@@ -291,9 +352,22 @@ export namespace DistantCarRenderer
                 const float scale = car.boat ? 1.0f : CarScale;
                 auto world = [&](const CVector& p) { return position + (right * p.x + forward * p.y + up * p.z) * scale; };
                 auto normal = [&](const CVector& n) { return right * n.x + forward * n.y + up * n.z; };
-                if (vertices.size() + mesh.vertices.size() > vertexLimit || indices.size() + mesh.indices.size() > 24000) flush();
-                batchIds.push_back(car.id);
-                short base = static_cast<short>(vertices.size());
+#ifdef PROJECT2DFX_SA
+                if (gpuCars)
+                {
+                    if (gpuVertices.size() + mesh.vertices.size() > GpuD3D9::MAX_CAR_VERTICES ||
+                        gpuIndices.size() + mesh.indices.size() > GpuD3D9::MAX_CAR_INDICES ||
+                        gpuWorlds.size() == GpuD3D9::MAX_CARS_PER_BATCH)
+                        flush();
+                    batchIds.push_back(car.id);
+                }
+                else
+#endif
+                {
+                    if (vertices.size() + mesh.vertices.size() > vertexLimit ||
+                        indices.size() + mesh.indices.size() > 24000) flush();
+                    batchIds.push_back(car.id);
+                }
                 // A large additive glow outlives a nearly transparent body even
                 // with the same alpha. Fade its intensity and footprint together.
                 float lightFade = car.fade * Saturate((car.fade - .10f) / .90f) * FogVisibility(position);
@@ -306,8 +380,6 @@ export namespace DistantCarRenderer
                     car.state->appearanceSet = true;
                 }
                 const auto& paint = paints[car.state->paint % std::size(paints)];
-                const float ambient = fNightAmbient * (1.0f - daylight) + .14f * daylight + daylight * .42f;
-                const float diffuse = daylight * .34f;
                 const uint32_t alpha = static_cast<uint32_t>(static_cast<int>(255 * car.fade)) << 24;
                 // Components are bounded to [0,255]. A signed conversion avoids
                 // the x86 unsigned float-conversion runtime helper per channel.
@@ -317,6 +389,46 @@ export namespace DistantCarRenderer
                         (static_cast<uint32_t>(static_cast<int>(g * light)) << 8) |
                         static_cast<uint32_t>(static_cast<int>(b * light));
                 };
+#ifdef PROJECT2DFX_SA
+                if (gpuCars)
+                {
+                    const uint16_t baseVertex = static_cast<uint16_t>(gpuVertices.size());
+                    const float matrixIdx = static_cast<float>(gpuWorlds.size());
+                    GpuD3D9::CarWorld xform{{
+                        right.x*scale,right.y*scale,right.z*scale,0,
+                        forward.x*scale,forward.y*scale,forward.z*scale,0,
+                        up.x*scale,up.y*scale,up.z*scale,0,
+                        position.x,position.y,position.z,1
+                    }};
+                    gpuWorlds.push_back(xform);
+                    auto* out = gpuVertices.append(mesh.vertices.size());
+                    auto* ind = gpuIndices.append(mesh.indices.size());
+                    if (!out || !ind) { HideLights(car.id); continue; }
+                    for (const auto& v : mesh.vertices)
+                    {
+                        uint32_t r = paint[0], g = paint[1], b = paint[2];
+                        switch (v.material)
+                        {
+                        case DistantCarMesh::BoatHull:
+                            r=(v.color>>16)&255; g=(v.color>>8)&255; b=v.color&255; break;
+                        case DistantCarMesh::Glass: r=44;g=62;b=73;break;
+                        case DistantCarMesh::Rubber:r=23;g=24;b=25;break;
+                        case DistantCarMesh::Chrome:r=135;g=139;b=140;break;
+                        case DistantCarMesh::Headlight:r=245;g=239;b=206;break;
+                        case DistantCarMesh::Taillight:r=175;g=16;b=10;break;
+                        default:break;
+                        }
+                        *out++={v.position.x,v.position.y,v.position.z,
+                                v.normal.x,v.normal.y,v.normal.z,
+                                alpha | (r<<16) | (g<<8) | b,
+                                static_cast<float>(v.material),matrixIdx};
+                    }
+                    for (short i : mesh.indices) *ind++=baseVertex+static_cast<uint16_t>(i);
+                }
+                else
+#endif
+                {
+                short base = static_cast<short>(vertices.size());
                 const uint32_t nightColors[] = {
                     rgb(paint[0], paint[1], paint[2], ambient), rgb(44, 62, 73, ambient),
                     rgb(23, 24, 25, ambient), rgb(135, 139, 140, ambient),
@@ -356,6 +468,8 @@ export namespace DistantCarRenderer
                     vertex.color = alpha | rgb(r, g, b, light);
                 }
                 for (short index : mesh.indices) *outputIndices++ = base + index;
+                }
+
 
                 // Lamps are always on (dimmed by day) and are readable from the
                 // side too: a 3D car whose lights only show when it drives

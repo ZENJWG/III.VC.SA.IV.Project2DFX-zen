@@ -1,6 +1,14 @@
 module;
 
+// filewatch uses Apple's #pragma mark, which MSVC does not recognize.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4068)
+#endif
 #include <FileWatch.hpp>
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
@@ -120,7 +128,16 @@ export
     float fNewFarClip, fMaxPossibleDrawDistance;
     float fMaxDrawDistanceForNormalObjects, fTimedObjectsDrawDistance, fNeonsDrawDistance, fLODObjectsDrawDistance;
     float fGenericObjectsDrawDistance, fAllNormalObjectsDrawDistance, fVegetationDrawDistance;
+    float fBigBuildingsDrawDistance;
+    float fAnimatedObjectsDrawDistance = 0.0f;
+    bool bIncludeInteriorObjectsDrawDistance = false;
     bool bLoadAllBinaryIPLs, bPreloadLODs;
+    // SA-only opt-in model pinning; defaults to off to protect streaming memory.
+    bool bPreloadNormalModels = false, bPreloadTimedModels = false;
+    bool bPreloadVegetationModels = false, bPreloadGenericModels = false;
+    bool bPreloadNeonModels = false, bPreloadBigBuildingModels = false;
+    bool bPreloadAnimatedModels = false, bPreloadAllLODModels = false;
+    int iPreloadMaxModels = 128, iPreloadBatchSize = 16;
     float fDrawDistance;
     bool bRandomExplosionEffects, bReplaceSmokeTrailWithBulletTrail;
     float fStaticSunSize;
@@ -142,6 +159,8 @@ export
     bool bDistantCars3D = false;
     bool bDistantBoats3D = true;
     bool bDistantCars3DLights = true;
+    bool bGtaSaGpuCars = false;
+    bool bGtaSaGpuLightQuads = false;
     float fDistantCarsGroundOffset = 0.0f;
 
     void ReadIniSettings()
@@ -168,6 +187,8 @@ export
         bDistantBoats3D = iniReader.ReadInteger("LodLights", "DistantBoats3D", 1) != 0;
         bDistantCars3DLights = iniReader.ReadInteger("LodLights", "DistantCars3DLights", 1) != 0;
         fDistantCarsGroundOffset = iniReader.ReadFloat("LodLights", "DistantCarsGroundOffset", 0.0f);
+        bGtaSaGpuCars = iniReader.ReadInteger("LodLights", "GpuDistantCars", 0) != 0;
+        bGtaSaGpuLightQuads = iniReader.ReadInteger("LodLights", "GpuLightQuads", 0) != 0;
         if (!std::isfinite(fDistantCarsGroundOffset)) fDistantCarsGroundOffset = 0.0f;
         fDistantCarsGroundOffset = (std::clamp)(fDistantCarsGroundOffset, -2.0f, 2.0f);
 
@@ -200,11 +221,24 @@ export
         fTimedObjectsDrawDistance = iniReader.ReadFloat("IDETweaker", "TimedObjectsDrawDistance", 0.0f);
         fNeonsDrawDistance = iniReader.ReadFloat("IDETweaker", "NeonsDrawDistance", 0.0f);
         fLODObjectsDrawDistance = iniReader.ReadFloat("IDETweaker", "LODObjectsDrawDistance", 0.0f);
+        fBigBuildingsDrawDistance = iniReader.ReadFloat("IDETweaker", "BigBuildingsDrawDistance", 0.0f);
+        fAnimatedObjectsDrawDistance = iniReader.ReadFloat("IDETweaker", "AnimatedObjectsDrawDistance", 0.0f);
+        bIncludeInteriorObjectsDrawDistance = iniReader.ReadInteger("IDETweaker", "IncludeInteriorObjectsDrawDistance", 0) != 0;
         fGenericObjectsDrawDistance = iniReader.ReadFloat("IDETweaker", "GenericObjectsDrawDistance", 0.0f);
         fAllNormalObjectsDrawDistance = iniReader.ReadFloat("IDETweaker", "AllNormalObjectsDrawDistance", 0.0f);
         fVegetationDrawDistance = iniReader.ReadFloat("IDETweaker", "VegetationDrawDistance", 0.0f);
         fDrawDistance = iniReader.ReadFloat("IDETweaker", "DrawDistance", 0.0f);
         bPreloadLODs = iniReader.ReadInteger("IDETweaker", "PreloadLODs", 0) != 0;
+        bPreloadNormalModels = iniReader.ReadInteger("IDETweaker", "PreloadNormalModels", 0) != 0;
+        bPreloadTimedModels = iniReader.ReadInteger("IDETweaker", "PreloadTimedModels", 0) != 0;
+        bPreloadVegetationModels = iniReader.ReadInteger("IDETweaker", "PreloadVegetationModels", 0) != 0;
+        bPreloadGenericModels = iniReader.ReadInteger("IDETweaker", "PreloadGenericModels", 0) != 0;
+        bPreloadNeonModels = iniReader.ReadInteger("IDETweaker", "PreloadNeonModels", 0) != 0;
+        bPreloadBigBuildingModels = iniReader.ReadInteger("IDETweaker", "PreloadBigBuildingModels", 0) != 0;
+        bPreloadAnimatedModels = iniReader.ReadInteger("IDETweaker", "PreloadAnimatedModels", 0) != 0;
+        bPreloadAllLODModels = iniReader.ReadInteger("IDETweaker", "PreloadAllLODModels", 0) != 0;
+        iPreloadMaxModels = iniReader.ReadInteger("IDETweaker", "PreloadMaxModels", 128);
+        iPreloadBatchSize = iniReader.ReadInteger("IDETweaker", "PreloadBatchSize", 16);
 
         // Misc section
         bRandomExplosionEffects = iniReader.ReadInteger("Misc", "RandomExplosionEffects", 0) != 0;

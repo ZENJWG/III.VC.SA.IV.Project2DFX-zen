@@ -1184,8 +1184,9 @@ int _tmain(int argc, _TCHAR* argv[])
 
         while (getline(IPLData, line))
         {
-            int ModelId; char ModelName[100]; int Interior; float PosX, PosY, PosZ;
-            float RotX, RotY, RotZ, RotW;
+            int ModelId = 0;
+            char ModelName[100] = {};
+            int Interior = 0;
 
             struct RwV3d2
             {
@@ -1194,34 +1195,38 @@ int _tmain(int argc, _TCHAR* argv[])
                 double z;
             };
 
-            RwV3d2 trans2, scale2, axis2;
-            RwV3d trans, scale, axis;
-            double angle;
+            RwV3d2 trans2{}, scale2{}, axis2{};
+            RwV3d trans{}, scale{}, axis{};
+            double angle = 0.0;
             line.erase(std::remove(line.begin(), line.end(), ','), line.end());
-            if (sscanf(line.c_str(), "%d %s %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+            int fields = sscanf(line.c_str(), "%d %99s %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
                 &ModelId, ModelName, &Interior,
                 &trans2.x, &trans2.y, &trans2.z,
                 &scale2.x, &scale2.y, &scale2.z,
-                &axis2.x, &axis2.y, &axis2.z, &angle) != 13)
+                &axis2.x, &axis2.y, &axis2.z, &angle);
+            if (fields != 13)
             {
-                sscanf(line.c_str(), "%d %s %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+                fields = sscanf(line.c_str(), "%d %99s %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
                     &ModelId, ModelName,
                     &trans2.x, &trans2.y, &trans2.z,
                     &scale2.x, &scale2.y, &scale2.z,
                     &axis2.x, &axis2.y, &axis2.z, &angle);
+                if (fields != 12)
+                    continue; // Skip invalid IPL records; do not use partial/uninitialized values.
             }
 
-            trans.x = trans2.x;
-            trans.y = trans2.y;
-            trans.z = trans2.z;
+            // IPL coordinates are stored as double, RenderWare vectors as float.
+            trans.x = static_cast<float>(trans2.x);
+            trans.y = static_cast<float>(trans2.y);
+            trans.z = static_cast<float>(trans2.z);
 
-            scale.x = scale2.x;
-            scale.y = scale2.y;
-            scale.z = scale2.z;
+            scale.x = static_cast<float>(scale2.x);
+            scale.y = static_cast<float>(scale2.y);
+            scale.z = static_cast<float>(scale2.z);
 
-            axis.x = axis2.x;
-            axis.y = axis2.y;
-            axis.z = axis2.z;
+            axis.x = static_cast<float>(axis2.x);
+            axis.y = static_cast<float>(axis2.y);
+            axis.z = static_cast<float>(axis2.z);
 
             {
                 LodLights2.clear();
@@ -1250,7 +1255,9 @@ int _tmain(int argc, _TCHAR* argv[])
                             sscanf(line.c_str(), "%3d %3d %3d %3d %f %f %f %f %f %2d %1d %1d", &nRed, &nGreen, &nBlue, &nAlpha, &fOffsetX, &fOffsetY, &fOffsetZ, &fCustomSize, &fDistance, &nCoronaShowMode, &nNoDistance, &nDrawSearchlight);
 
                             CMatrix dummyMatrix;
-                            auto angle2 = -RADTODEG(2.0f * acos(angle));
+                            // Roundoff may place a quaternion scalar just outside [-1, 1].
+                            const double safeAngle = (std::max)(-1.0, (std::min)(1.0, angle));
+                            const float angle2 = static_cast<float>(-RADTODEG(2.0 * acos(safeAngle)));
                             makeRotation(&dummyMatrix, &axis, angle2, &trans);
 
                             auto pos = dummyMatrix * CVector(fOffsetX, fOffsetY, fOffsetZ);

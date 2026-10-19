@@ -1,6 +1,7 @@
 module;
 
 #include <stdafx.h>
+#include <cmath> // std::isfinite for fixed-point path-node bounds checks
 #include "../DistantTraffic.hpp"
 
 export module DistantCars;
@@ -134,9 +135,18 @@ struct CPathNode
     CVector GetPosition(void) { return CVector(x / 8.0f, y / 8.0f, z / 8.0f); }
     void SetPosition(const CVector& p)
     {
-        x = p.x * 8.0f;
-        y = p.y * 8.0f;
-        z = p.z * 8.0f;
+        // GTA VC stores path-node coordinates as signed 16-bit fixed point (1/8 unit).
+        // Clamp before conversion: out-of-range floats cannot be cast safely.
+        const auto encode = [](float value) -> int16_t {
+            const float scaled = value * 8.0f;
+            if (!std::isfinite(scaled)) return 0;
+            if (scaled <= -32768.0f) return INT16_MIN;
+            if (scaled >= 32767.0f) return INT16_MAX;
+            return static_cast<int16_t>(scaled); // preserve truncation toward zero
+        };
+        x = encode(p.x);
+        y = encode(p.y);
+        z = encode(p.z);
     }
     float GetX(void) { return x / 8.0f; }
     float GetY(void) { return y / 8.0f; }

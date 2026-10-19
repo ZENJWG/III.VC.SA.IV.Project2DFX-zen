@@ -1,7 +1,11 @@
-﻿#define NOMINMAX
+#define NOMINMAX
 #include "stdafx.h"
-#include <ranges>
-#include <deque>
+#include "DrawDistancePolicy.hpp"
+#include "ModelPreloadPolicy.hpp"
+#include "SAObjectClassification.hpp"
+#include <cstdio>
+#include <array>
+#include <bitset>
 
 import ComVars;
 import LamppostInfo;
@@ -16,7 +20,6 @@ import Sprite;
 import Misc;
 import SearchLightCone;
 import Timecycle;
-import ModelInfo;
 import PointLights;
 import DistantCars;
 import DistantCarRenderer;
@@ -44,25 +47,28 @@ void RegisterLamppost(CEntity* pObj)
     dummyMatrix.SetTranslateOnly(objTransform.m_translate.x, objTransform.m_translate.y, objTransform.m_translate.z);
     dummyMatrix.SetRotateZOnly(objTransform.m_heading);
 
-    auto foundElements = FileContent | std::views::filter([minKey = PackKey(nModelID, 0), maxKey = PackKey(nModelID, 0xFFFF)](const auto& kv)
-    {
-        return kv.first >= minKey && kv.first <= maxKey;
-    });
+    // std::map is sorted by packed model ID. Avoid scanning the entire IDE light
+    // table once for every streamed lamp post (was std::views::filter).
+    const auto first = FileContent.lower_bound(PackKey(nModelID, 0));
+    const auto last = FileContent.upper_bound(PackKey(nModelID, 0xFFFF));
+    if (first == last) return;
 
     auto ms_modelInfoPtrs = *CModelInfo::pp_modelInfoPtrs;
     auto modelInfo = ms_modelInfoPtrs[nModelID];
+    if (!modelInfo) return; // m_fDrawDistance is dereferenced below.
 
     // Get bounding box height from model info
     float objectHeight = 0.0f;
-    if (modelInfo && modelInfo->m_pColModel)
+    if (modelInfo->m_pColModel)
     {
         // Get height from bounding box
         objectHeight = modelInfo->m_pColModel->m_Box.max.z - modelInfo->m_pColModel->m_Box.min.z;
         //objectHeight = colModel->m_Sphere.sphere.m_fRadius * 2.0f;
     }
 
-    for (const auto& [key, data] : foundElements)
+    for (auto it = first; it != last; ++it)
     {
+        const auto& data = it->second;
         CVector worldPos = dummyMatrix * data.vecLocalPos;
 
         m_Lampposts.push_back(CLamppostInfo(
@@ -74,11 +80,151 @@ void RegisterLamppost(CEntity* pObj)
             data.nNoDistance,
             data.nDrawSearchlight ? static_cast<int>(objectHeight) : 0,
             pObj->GetTransform().m_heading,
-            std::min(data.fObjectDrawDistance, modelInfo->m_fDrawDistance),
+            (std::min)(data.fObjectDrawDistance, modelInfo->m_fDrawDistance),
             data.pPredicate
         ));
         if (data.fCustomSizeMult == .45f)
             m_Lampposts.back().nTrafficLightType = CTrafficLights::Type(pObj, dummyMatrix.GetForward());
+    }
+}
+
+// GTA SA model preloader: capture *IDE model IDs* during level loading and
+// request a bounded, deduplicated set once the game reaches GAMESTATE_LOADED.
+// Unlike PreloadLODs, this does NOT manufacture an RwObject for each entity.
+// Pinning every map model can exhaust the game's streaming memory: opt in,
+// keep a strict model-count cap, and never run on the renderer hot path.
+namespace ModelPreloader
+{
+    static std::array<std::uint8_t, ModelPreloadPolicy::kModelCount> categories{};
+    static std::bitset<ModelPreloadPolicy::kModelCount> requested{};
+    static bool completed = false;
+
+    std::uint8_t Enabled()
+    {
+        return ModelPreloadPolicy::EnabledMask(
+            bPreloadNormalModels, bPreloadTimedModels,
+            bPreloadVegetationModels, bPreloadGenericModels,
+            bPreloadNeonModels, bPreloadBigBuildingModels,
+            bPreloadAnimatedModels, bPreloadAllLODModels);
+    }
+
+    void Reset()
+    {
+        categories.fill(0);
+        requested.reset();
+        completed = false;
+    }
+
+    void Record(int modelId, std::uint8_t category)
+    {
+        if (ModelPreloadPolicy::ValidId(modelId))
+            categories[static_cast<size_t>(modelId)] |= category;
+    }
+
+    // The normal/generic/vegetation membership is based on the *original*
+    // IDE distance, not an already extended value.
+    void RecordObject(int modelId, float rawDistance, bool interior,
+                      SAObjectClassification::Kind kind)
+    {
+        Record(modelId, ModelPreloadPolicy::ObjectCategories(modelId, rawDistance,
+            interior, kind.generic, kind.vegetation));
+    }
+
+    void Flush()
+    {
+        if (completed || !Enabled() || gGameState != 9)
+            return;
+        auto** modelTable = CModelInfo::pp_modelInfoPtrs ?
+            *CModelInfo::pp_modelInfoPtrs : nullptr;
+        if (!modelTable || !CStreaming::RequestModel || !CStreaming::LoadAllRequestedModels)
+            return;
+        completed = true; // Once per level; never block the regular render loop.
+
+        const auto enabled = Enabled();
+        const unsigned limit = ModelPreloadPolicy::ClampLimit(
+            iPreloadMaxModels, 128u, 1024u);
+        const unsigned batchSize = ModelPreloadPolicy::ClampLimit(
+            iPreloadBatchSize, 16u, 64u);
+        unsigned count = 0, queued = 0;
+
+        // Prefer rare, targeted categories over "all normal" when capped.
+        constexpr std::uint8_t order[] = {
+            ModelPreloadPolicy::BigBuilding, ModelPreloadPolicy::Neon,
+            ModelPreloadPolicy::Timed, ModelPreloadPolicy::Animated,
+            ModelPreloadPolicy::Vegetation, ModelPreloadPolicy::Generic,
+            ModelPreloadPolicy::Lod, ModelPreloadPolicy::Normal
+        };
+        constexpr int flags = 0x2 | 0x8; // GAME_REQUIRED | KEEP_IN_MEMORY
+        for (const auto category : order)
+        {
+            if (!(enabled & category)) continue;
+            for (int id = 0; id < ModelPreloadPolicy::kModelCount && count < limit; ++id)
+            {
+                const auto index = static_cast<size_t>(id);
+                if (!(categories[index] & category) || requested.test(index) || !modelTable[id])
+                    continue;
+                requested.set(index);
+                CStreaming::RequestModel(id, flags);
+                ++count;
+                if (++queued >= batchSize)
+                {
+                    CStreaming::LoadAllRequestedModels(false);
+                    queued = 0;
+                }
+            }
+        }
+        if (queued)
+            CStreaming::LoadAllRequestedModels(false);
+    }
+}
+
+// SetupBigBuilding marks each *entity*, not each IDE model. Patch the
+// associated model's draw radius after vanilla initialization. IPLs may
+// instantiate the same model many times: never compound multipliers.
+namespace BigBuildingDrawDistance
+{
+    static SafetyHookInline setupHook{};
+    static std::bitset<20000> patchedModels{};
+    static std::array<float,20000> rawObjectDistances{};
+
+    void Remember(int id, float distance)
+    {
+        if (id >= 0 && id < 20000 && std::isfinite(distance) && distance > 0.0f)
+            rawObjectDistances[static_cast<size_t>(id)] = distance;
+    }
+
+    void __fastcall Setup(CEntity* entity, void*)
+    {
+        setupHook.thiscall<void>(entity);
+        if (!entity || !entity->bIsBIGBuilding)
+            return;
+
+        const int id = entity->GetModelIndex();
+        ModelPreloader::Record(id, ModelPreloadPolicy::BigBuilding);
+        const bool lodOn = std::isfinite(fLODObjectsDrawDistance) &&
+            fLODObjectsDrawDistance > 0.0f;
+        const bool bigOn = std::isfinite(fBigBuildingsDrawDistance) &&
+            fBigBuildingsDrawDistance > 0.0f;
+        if (!lodOn && !bigOn)
+            return;
+        if (id < 0 || id >= 20000 || patchedModels.test(static_cast<size_t>(id)))
+            return;
+
+        auto modelTable = *CModelInfo::pp_modelInfoPtrs;
+        if (!modelTable || !modelTable[id])
+            return;
+
+        // Set only after successful model lookup. This flag is reset when
+        // a new level is loaded (game save/new game).
+        patchedModels.set(static_cast<size_t>(id));
+        auto* info = modelTable[id];
+        const float original = rawObjectDistances[static_cast<size_t>(id)] > 0.0f ?
+            rawObjectDistances[static_cast<size_t>(id)] : info->m_fDrawDistance;
+        // A real LOD (bIsBIGBuilding) may have original IDE distance <=300,
+        // unlike the legacy >300 heuristic. Respect both model and entity.
+        info->m_fDrawDistance = DrawDistancePolicy::BigBuildingCombined(
+            original, info->m_fDrawDistance, fLODObjectsDrawDistance,
+            fBigBuildingsDrawDistance);
     }
 }
 
@@ -92,6 +238,103 @@ CEntity* PossiblyAddThisEntity(CEntity* pEntity)
 namespace CFileLoader
 {
     SafetyHookInline shLoadObjectInstance = {};
+    SafetyHookInline shLoadObjectTypes = {};
+    SafetyHookInline shLoadObject = {};
+    SafetyHookInline shLoadTimeObject = {};
+    SafetyHookInline shLoadAnimatedClumpObject = {};
+    // LoadObjectTypes is called once per IDE: retain its source filename
+    // while the original parser dispatches OBJS/TOBJ/ANIM sections.
+    static const char* currentIdePath = nullptr;
+
+    void __cdecl LoadObjectTypes(const char* file)
+    {
+        const char* previous = currentIdePath;
+        currentIdePath = file;
+        shLoadObjectTypes.unsafe_ccall<void>(file);
+        currentIdePath = previous;
+    }
+
+    int __cdecl LoadObject(const char* line)
+    {
+        // GTA SA 1.0 US CFileLoader::LoadObject at 0x5B3C60.
+        // Hook the complete loader AFTER it handles 1/2/3-atomic IDE rows.
+        const int id = shLoadObject.unsafe_ccall<int>(line);
+        if (!ModelPreloadPolicy::ValidId(id) || !line ||
+            !CModelInfo::pp_modelInfoPtrs || !*CModelInfo::pp_modelInfoPtrs)
+            return id;
+        CBaseModelInfo* info = (*CModelInfo::pp_modelInfoPtrs)[id];
+        if (!info) return id;
+
+        const float original = info->m_fDrawDistance;
+        if (!std::isfinite(original) || original <= 0.0f) return id;
+        char name[24] = {};
+        // Optional name: malformed lines have already been rejected by vanilla.
+        (void)std::sscanf(line, "%*d %23s", name);
+        const auto kind = SAObjectClassification::Classify(id, name, currentIdePath);
+        const bool interior = !bIncludeInteriorObjectsDrawDistance &&
+            SAObjectClassification::IsInterior(id);
+        BigBuildingDrawDistance::Remember(id, original);
+        ModelPreloader::RecordObject(id, original, interior, kind);
+
+        const float distance = DrawDistancePolicy::ObjectTagged(original, interior,
+            kind.generic, kind.vegetation, fLODObjectsDrawDistance,
+            fGenericObjectsDrawDistance, fAllNormalObjectsDrawDistance,
+            fVegetationDrawDistance);
+        info->m_fDrawDistance = distance;
+        if (original <= 300.0f && !interior)
+            fMaxDrawDistanceForNormalObjects =
+                (std::max)(fMaxDrawDistanceForNormalObjects, distance);
+        return id;
+    }
+
+    // TOBJ is NOT parsed by LoadObject. GTA SA Reversed: 0x5B3DE0.
+    int __cdecl LoadTimeObject(const char* line)
+    {
+        const int id = shLoadTimeObject.unsafe_ccall<int>(line);
+        if (!ModelPreloadPolicy::ValidId(id) || !line ||
+            !CModelInfo::pp_modelInfoPtrs || !*CModelInfo::pp_modelInfoPtrs)
+            return id;
+        CBaseModelInfo* info = (*CModelInfo::pp_modelInfoPtrs)[id];
+        if (!info) return id;
+        char name[24] = {};
+        if (std::sscanf(line, "%*d %23s", name) != 1) return id;
+        ModelPreloader::Record(id,
+            ModelPreloadPolicy::TimeCategories(DrawDistancePolicy::IsNeon(name)));
+        const float original = info->m_fDrawDistance;
+        BigBuildingDrawDistance::Remember(id, original);
+        const float changed = DrawDistancePolicy::Timed(
+            original, name, fTimedObjectsDrawDistance, fNeonsDrawDistance);
+        if (std::isfinite(changed) && changed > original)
+            info->m_fDrawDistance = changed;
+        return id;
+    }
+
+    // ANIM entries use CFileLoader::LoadAnimatedClumpObject (0x5B40C0).
+    // GTA SA Reversed uses an int return type; preserve EAX for callers.
+    // Some plugin-sdk versions declare this routine void.
+    int __cdecl LoadAnimatedClumpObject(const char* line)
+    {
+        const int result = shLoadAnimatedClumpObject.unsafe_ccall<int>(line);
+        if (result < 0 || !line || !CModelInfo::pp_modelInfoPtrs ||
+            !*CModelInfo::pp_modelInfoPtrs) return result;
+        int id = -1;
+        char name[24] = {}, txd[24] = {}, anim[16] = {};
+        float parsedDistance = 0.0f;
+        unsigned flags = 0;
+        if (std::sscanf(line, "%d %23s %23s %15s %f %u",
+            &id, name, txd, anim, &parsedDistance, &flags) != 6 ||
+            !ModelPreloadPolicy::ValidId(id)) return result;
+        CBaseModelInfo* info = (*CModelInfo::pp_modelInfoPtrs)[id];
+        if (!info || !std::isfinite(info->m_fDrawDistance) ||
+            info->m_fDrawDistance <= 0.0f) return result;
+        const float original = info->m_fDrawDistance;
+        BigBuildingDrawDistance::Remember(id, original);
+        ModelPreloader::Record(id, ModelPreloadPolicy::Animated);
+        info->m_fDrawDistance =
+            DrawDistancePolicy::Animated(original, fAnimatedObjectsDrawDistance);
+        return result;
+    }
+
     CEntity* __cdecl LoadObjectInstance(void* inst)
     {
         return PossiblyAddThisEntity(shLoadObjectInstance.unsafe_ccall<CEntity*>(inst));
@@ -100,50 +343,67 @@ namespace CFileLoader
 
 float fSunSizeMult1 = 2.7335f;
 float fSunSizeMult2 = 6.0f;
+// Keep the INI setting unchanged (0 means adaptive). Storing the calculated
+// multiplier back into fFarClipMultiplier previously disabled adaptation after
+// the very first iteration.
+static float fEffectiveFarClipMultiplier = 1.0f;
 void DrawDistanceChanger()
 {
-    // FarClipMultiplier > 10.0 = static farclip value.
     if (fFarClipMultiplier > 10.0f)
     {
+        // Static far-clip distance in game units, not a sky/sun multiplier.
+        fEffectiveFarClipMultiplier = fFarClipMultiplier;
         fSunSizeMult1 = 2.7335f;
         fSunSizeMult2 = 6.0f;
         return;
     }
 
-    // FarClipMultiplier != 0.0 = fixed multiplier, already stored in fFarClipMultiplier.
-    if (fFarClipMultiplier != 0.0f)
+    if (fFarClipMultiplier > 0.0f)
     {
-        fSunSizeMult1 = 2.7335f * fFarClipMultiplier;
-        fSunSizeMult2 = 6.0f * fFarClipMultiplier;
-        return;
+        fEffectiveFarClipMultiplier = fFarClipMultiplier;
     }
-
-    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    static std::deque<int64_t> frameTimes;
-    static float adaptiveBase = fFarClipMinMultiplier;
-
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    frameTimes.push_back(now.QuadPart);
-    if (frameTimes.size() > 60)
-        frameTimes.pop_front();
-
-    if (frameTimes.size() >= 2)
+    else
     {
-        float smoothFPS = (float)(frameTimes.size() - 1) * (float)freq.QuadPart / (float)(frameTimes.back() - frameTimes.front());
-        const float step = (fFarClipMaxMultiplier - fFarClipMinMultiplier) * 0.002f;
-        if (smoothFPS < (float)nFarClipTargetFPS)
-            adaptiveBase -= step;
-        else
-            adaptiveBase += step;
+        static LARGE_INTEGER freq = [] {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return value;
+        }();
+        // Fixed-size ring avoids deque growth/shrink and allocator traffic in
+        // this per-frame hook.
+        static std::array<int64_t, 60> frameTimes{};
+        static size_t sampleCount = 0;
+        static size_t nextSample = 0;
+        static float adaptiveBase = fFarClipMinMultiplier;
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        frameTimes[nextSample] = now.QuadPart;
+        nextSample = (nextSample + 1) % frameTimes.size();
+        sampleCount = (std::min)(sampleCount + 1, frameTimes.size());
+
+        if (sampleCount >= 2 && freq.QuadPart > 0)
+        {
+            const size_t oldest = (nextSample + frameTimes.size() - sampleCount) % frameTimes.size();
+            const auto elapsed = now.QuadPart - frameTimes[oldest];
+            if (elapsed > 0)
+            {
+                float smoothFPS = static_cast<float>(frameTimes.size() - 1) *
+                    static_cast<float>(freq.QuadPart) / static_cast<float>(elapsed);
+                const float step = (fFarClipMaxMultiplier - fFarClipMinMultiplier) * 0.002f;
+                adaptiveBase += smoothFPS < static_cast<float>(nFarClipTargetFPS) ? -step : step;
+                adaptiveBase = (std::clamp)(adaptiveBase, fFarClipMinMultiplier, fFarClipMaxMultiplier);
+            }
+        }
+
+        const float cameraZ = GetCamPos()->z;
+        const float heightBonus = std::isfinite(cameraZ) ?
+            fFarClipHeightFactor * (std::max)(cameraZ, 0.0f) : 0.0f;
+        fEffectiveFarClipMultiplier = (std::clamp)(adaptiveBase + heightBonus,
+            fFarClipMinMultiplier, fFarClipMaxMultiplier);
     }
-
-    float camZ = GetCamPos()->z;
-    float heightBonus = fFarClipHeightFactor * std::max(camZ, 0.0f);
-
-    fFarClipMultiplier = std::clamp(adaptiveBase + heightBonus, fFarClipMinMultiplier, fFarClipMaxMultiplier);
-    fSunSizeMult1 = 2.7335f * fFarClipMultiplier;
-    fSunSizeMult2 = 6.0f * fFarClipMultiplier;
+    fSunSizeMult1 = 2.7335f * fEffectiveFarClipMultiplier;
+    fSunSizeMult2 = 6.0f * fEffectiveFarClipMultiplier;
 }
 
 void ApplyMemoryPatches()
@@ -152,6 +412,9 @@ void ApplyMemoryPatches()
     static auto CFileLoaderLoadLevelHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
     {
         LoadDatFile();
+        BigBuildingDrawDistance::patchedModels.reset();
+        BigBuildingDrawDistance::rawObjectDistances.fill(0.0f);
+        ModelPreloader::Reset();
         if (!m_bCatchLamppostsNow)
         {
             bRenderLodLights = 0;
@@ -219,10 +482,10 @@ void ApplyMemoryPatches()
 
         if (CGame::currArea == 0 || !inTransition)
         {
-            if (fFarClipMultiplier > 10.0f)
-                CTimeCycle::m_fCurrentFarClip = fFarClipMultiplier;
+            if (fEffectiveFarClipMultiplier > 10.0f)
+                CTimeCycle::m_fCurrentFarClip = fEffectiveFarClipMultiplier;
             else
-                CTimeCycle::m_fCurrentFarClip *= fFarClipMultiplier;
+                CTimeCycle::m_fCurrentFarClip *= fEffectiveFarClipMultiplier;
         }
     });
 
@@ -277,212 +540,112 @@ void ApplyMemoryPatches()
         injector::WriteMemory(0x6FD3F8, &fStaticShadowsIntensity, true); // = 0x859AA0 + 0x0->fmul    ds : flt_859AA0
     }
 
-    if (fTimedObjectsDrawDistance || fNeonsDrawDistance)
+    if ((std::isfinite(fBigBuildingsDrawDistance) && fBigBuildingsDrawDistance > 0.0f) ||
+        (std::isfinite(fLODObjectsDrawDistance) && fLODObjectsDrawDistance > 0.0f) ||
+        bPreloadBigBuildingModels)
     {
-        struct IncreaseDrawDistanceForTimedObjectsHook
-        {
-            void operator()(injector::reg_pack& regs)
-            {
-                regs.edi = regs.eax;
-                *(float*)(regs.esi + 0x18) = *(float*)&regs.ecx;
-
-                if ((fNeonsDrawDistance && strstr((char*)(regs.esp + 0x28), "neon") != NULL) || fTimedObjectsDrawDistance)
-                {
-                    if (fTimedObjectsDrawDistance <= 10.0f)
-                        *(float*)(regs.esi + 0x18) *= fTimedObjectsDrawDistance;
-                    else
-                        *(float*)(regs.esi + 0x18) = fTimedObjectsDrawDistance;
-                }
-            }
-        }; injector::MakeInline<IncreaseDrawDistanceForTimedObjectsHook>(0x5B3F4C);
+        // GTA SA 1.0 US: CEntity::SetupBigBuilding at 0x533150.
+        BigBuildingDrawDistance::setupHook =
+            safetyhook::create_inline(0x533150, BigBuildingDrawDistance::Setup);
     }
 
-    if (fLODObjectsDrawDistance || fGenericObjectsDrawDistance || fAllNormalObjectsDrawDistance || fVegetationDrawDistance)
+    const bool normalDistanceEnabled =
+        (std::isfinite(fLODObjectsDrawDistance) && fLODObjectsDrawDistance > 0.0f) ||
+        (std::isfinite(fGenericObjectsDrawDistance) && fGenericObjectsDrawDistance > 0.0f) ||
+        (std::isfinite(fAllNormalObjectsDrawDistance) && fAllNormalObjectsDrawDistance > 0.0f) ||
+        (std::isfinite(fVegetationDrawDistance) && fVegetationDrawDistance > 0.0f);
+    const bool normalPreloadEnabled = bPreloadNormalModels || bPreloadVegetationModels ||
+        bPreloadGenericModels || bPreloadAllLODModels;
+
+    if (normalDistanceEnabled || normalPreloadEnabled || fBigBuildingsDrawDistance > 0.0f)
     {
-        struct IncreaseDrawDistanceForObjectsHook
+        // The former 0x5B3D9F inline hook caught one internal assignment;
+        // detour the documented loader entry instead, covering multi-atomic
+        // entries and non-vanilla IDEs that call LoadObject.
+        CFileLoader::shLoadObject =
+            safetyhook::create_inline(0x5B3C60, CFileLoader::LoadObject);
+
+        // Preserve the source IDE filename while records are parsed. This
+        // identifies more generic/vegetation records than fixed ID ranges.
+        CFileLoader::shLoadObjectTypes =
+            safetyhook::create_inline(0x5B8400, CFileLoader::LoadObjectTypes);
+
+        if (fGenericObjectsDrawDistance > 0.0f ||
+            fAllNormalObjectsDrawDistance > 0.0f ||
+            fVegetationDrawDistance > 0.0f)
         {
-            void operator()(injector::reg_pack& regs)
-            {
-                *(float*)&regs.edx = *(float*)(regs.esp + 0xC);
-                regs.esi = regs.eax;
-
-                auto modelID = regs.ecx;
-                float drawDist = *(float*)(regs.esp + 0xC);
-
-                auto isInteriorObjectID = [](int id) -> bool
-                {
-                    if (id < 0) return false;
-                    if (id >= 910 && id <= 955) return true;
-                    if (id >= 1700 && id <= 1776) return true;
-                    if (id >= 2360 && id <= 2872) return true;
-                    if (id >= 2880 && id <= 2882) return true;
-                    if (id >= 13590 && id <= 13667) return true;
-                    if (id >= 14383 && id <= 14495) return true;
-                    if (id >= 14497 && id <= 14528) return true;
-                    if (id >= 14530 && id <= 14540) return true;
-                    if (id >= 14542 && id <= 14554) return true;
-                    if (id == 14556) return true;
-                    if (id >= 14558 && id <= 14614) return true;
-                    if (id >= 14616 && id <= 14630) return true;
-                    if (id >= 14632 && id <= 14633) return true;
-                    if (id >= 14635 && id <= 14641) return true;
-                    if (id == 14643) return true;
-                    if (id >= 14650 && id <= 14657) return true;
-                    if (id >= 14660 && id <= 14695) return true;
-                    if (id >= 14699 && id <= 14728) return true;
-                    if (id >= 14735 && id <= 14762) return true;
-                    if (id >= 14764 && id <= 14765) return true;
-                    if (id >= 14770 && id <= 14856) return true;
-                    if (id >= 14858 && id <= 14883) return true;
-                    if (id >= 14885 && id <= 14898) return true;
-                    if (id >= 14900 && id <= 14903) return true;
-                    if (id >= 15025 && id <= 15043) return true;
-                    if (id >= 15046 && id <= 15064) return true;
-                    if (id >= 18000 && id <= 18036) return true;
-                    if (id >= 18038 && id <= 18075) return true;
-                    if (id >= 18077 && id <= 18086) return true;
-                    if (id >= 18088 && id <= 18092) return true;
-                    if (id >= 18094 && id <= 18095) return true;
-                    if (id >= 18098 && id <= 18101) return true;
-                    if (id >= 18104 && id <= 18105) return true;
-                    if (id == 18109) return true;
-                    if (id == 18112) return true;
-
-                    if (id >= 1327 && id <= 1572) return true; //dynamic2.ide
-                    return false;
-                };
-
-                if (isInteriorObjectID(modelID))
-                {
-                    *(float*)&regs.edx = drawDist;
-                    return;
-                }
-
-                if (fVegetationDrawDistance)
-                {
-                    if (modelID >= 615 && modelID <= 792 && drawDist <= 300.0f)
-                    {
-                        if (fVegetationDrawDistance <= 10.0f)
-                            drawDist *= fVegetationDrawDistance;
-                        else
-                            drawDist = fVegetationDrawDistance;
-
-                        if (drawDist > fMaxDrawDistanceForNormalObjects)
-                            fMaxDrawDistanceForNormalObjects = drawDist;
-
-                        *(float*)&regs.edx = drawDist;
-                        return;
-                    }
-                }
-
-                if (drawDist > 300.0f)
-                {
-                    if (fLODObjectsDrawDistance)
-                    {
-                        if (fLODObjectsDrawDistance <= 10.0f)
-                            drawDist *= fLODObjectsDrawDistance;
-                        else if (fLODObjectsDrawDistance > drawDist)
-                            drawDist = fLODObjectsDrawDistance;
-                    }
-                }
-                else
-                {
-                    if (fGenericObjectsDrawDistance)
-                    {
-                        if (modelID >= 615 && modelID <= 1572)
-                        {
-                            if (fGenericObjectsDrawDistance <= 10.0f)
-                                drawDist *= fGenericObjectsDrawDistance;
-                            else
-                                drawDist = fGenericObjectsDrawDistance;
-                        }
-                        else
-                        {
-                            if (fAllNormalObjectsDrawDistance)
-                            {
-                                if (fAllNormalObjectsDrawDistance <= 10.0f)
-                                    drawDist *= fAllNormalObjectsDrawDistance;
-                                else
-                                    drawDist = fAllNormalObjectsDrawDistance;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (fAllNormalObjectsDrawDistance)
-                        {
-                            if (fAllNormalObjectsDrawDistance <= 10.0f)
-                                drawDist *= fAllNormalObjectsDrawDistance;
-                            else
-                                drawDist = fAllNormalObjectsDrawDistance;
-                        }
-                    }
-                    if (drawDist > fMaxDrawDistanceForNormalObjects)
-                        fMaxDrawDistanceForNormalObjects = drawDist;
-                }
-                *(float*)&regs.edx = drawDist;
-            }
-        }; injector::MakeInline<IncreaseDrawDistanceForObjectsHook>(0x5B3D9F, 0x5B3D9F + 6);
-
-        if (fGenericObjectsDrawDistance || fAllNormalObjectsDrawDistance || fVegetationDrawDistance)
-        {
-            injector::WriteMemory(0x554230 + 0x3FA + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fsub    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x192 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x1B8 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x1DB + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x24E + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x258 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x262 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x314 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x31E + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x328 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x382 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x39A + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x554FE0 + 0x3A8 + 0x2, &fMaxDrawDistanceForNormalObjects, true); //fmul    ds:flt_858FD8
-            injector::WriteMemory(0x5B51E0 + 0x09A + 0x2, &fMaxDrawDistanceForNormalObjects, true); // fcomp   ds:flt_858FD8
-            injector::WriteMemory(0x554230 + 0x3B6 + 0x2, &fMaxDrawDistanceForNormalObjects, true); // fcomp   ds:flt_858FD8
-            injector::WriteMemory(0x554230 + 0x3D0 + 0x2, &fMaxDrawDistanceForNormalObjects, true); // fld     ds:flt_858FD8
-            injector::WriteMemory(0x554230 + 0x3FA + 0x2, &fMaxDrawDistanceForNormalObjects, true); // fsub    ds:flt_858FD8
+            // Raise the engine's shared "normal" distance threshold so a
+            // longer per-model radius isn't clipped by vanilla world scanning.
+            injector::WriteMemory(0x554230 + 0x3FA + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x192 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x1B8 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x1DB + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x24E + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x258 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x262 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x314 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x31E + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x328 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x382 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x39A + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554FE0 + 0x3A8 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x5B51E0 + 0x09A + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554230 + 0x3B6 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554230 + 0x3D0 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            injector::WriteMemory(0x554230 + 0x3FA + 0x2, &fMaxDrawDistanceForNormalObjects, true);
         }
     }
 
-    if (bPreloadLODs)
+    if (fTimedObjectsDrawDistance > 0.0f || fNeonsDrawDistance > 0.0f ||
+        fBigBuildingsDrawDistance > 0.0f || bPreloadTimedModels || bPreloadNeonModels)
+        CFileLoader::shLoadTimeObject =
+            safetyhook::create_inline(0x5B3DE0, CFileLoader::LoadTimeObject);
+
+    if (fAnimatedObjectsDrawDistance > 0.0f || bPreloadAnimatedModels ||
+        fBigBuildingsDrawDistance > 0.0f)
+        CFileLoader::shLoadAnimatedClumpObject =
+            safetyhook::create_inline(0x5B40C0, CFileLoader::LoadAnimatedClumpObject);
+
+    if (bPreloadLODs || ModelPreloader::Enabled())
     {
-        enum eStreamingFlags
-        {
-            DEFAULT = 0x0,
-            GAME_REQUIRED = 0x2,
-            MISSION_REQUIRED = 0x4,
-            KEEP_IN_MEMORY = 0x8,
-            PRIORITY_REQUEST = 0x10,
-            LOADING_SCENE = 0x20,
-            SCM_COMMAND_FLAG = 0x0C
-        };
-
         static std::vector<CEntity*> lodPtrs;
-
-        pattern = hook::pattern("8A 48 ? 80 F9 ? 8B 3C 95");
-        static auto LinkLodsHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
+        if (bPreloadLODs)
         {
-            lodPtrs.push_back((CEntity*)regs.eax);
-        });
+            pattern = hook::pattern("8A 48 ? 80 F9 ? 8B 3C 95");
+            static auto LinkLodsHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
+            {
+                if (regs.eax)
+                    lodPtrs.push_back(reinterpret_cast<CEntity*>(regs.eax));
+            });
+        }
 
+        // Existing post-level-load location. Both kinds of preloads happen
+        // once after IDE/IPL model definitions have been parsed, not on draw.
         pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? A0");
         static auto CGameProcessHook2 = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
         {
-            if (gGameState != 9) //GAMESTATE_LOADED
+            if (gGameState != 9) // GAMESTATE_LOADED
                 return;
 
-            if (lodPtrs.empty())
-                return;
-
-            auto uniquePtrs = lodPtrs;
-            std::sort(uniquePtrs.begin(), uniquePtrs.end(), [](CEntity* a, CEntity* b) { return a->GetModelIndex() < b->GetModelIndex(); });
-            uniquePtrs.erase(std::unique(uniquePtrs.begin(), uniquePtrs.end(), [](CEntity* a, CEntity* b) { return a->GetModelIndex() == b->GetModelIndex(); }), uniquePtrs.end());
-            for (auto* e : uniquePtrs) CStreaming::RequestModel(e->GetModelIndex(), eStreamingFlags::GAME_REQUIRED | eStreamingFlags::KEEP_IN_MEMORY);
-            CStreaming::LoadAllRequestedModels(false);
-            for (auto* e : lodPtrs) if (!e->m_pRwObject) CreateRwObject(e, nullptr);
+            // Keep legacy PreloadLODs entity/RW-object behavior untouched.
+            if (bPreloadLODs && !lodPtrs.empty())
+            {
+                auto uniquePtrs = lodPtrs;
+                std::sort(uniquePtrs.begin(), uniquePtrs.end(), [](CEntity* a, CEntity* b) {
+                    return a->GetModelIndex() < b->GetModelIndex();
+                });
+                uniquePtrs.erase(std::unique(uniquePtrs.begin(), uniquePtrs.end(),
+                    [](CEntity* a, CEntity* b) { return a->GetModelIndex() == b->GetModelIndex(); }),
+                    uniquePtrs.end());
+                for (auto* e : uniquePtrs)
+                    CStreaming::RequestModel(e->GetModelIndex(), 0x2 | 0x8);
+                CStreaming::LoadAllRequestedModels(false);
+                for (auto* e : lodPtrs)
+                    if (!e->m_pRwObject)
+                        CreateRwObject(e, nullptr);
+            }
             lodPtrs.clear();
+            ModelPreloader::Flush();
         });
     }
 }
@@ -558,6 +721,16 @@ void GetMemoryAddresses()
 void Init()
 {
     ReadIniSettings();
+    // std::clamp requires an ordered range. Bad user INI values must not
+    // produce undefined behaviour in the adaptive draw-distance path.
+    if (!std::isfinite(fFarClipMinMultiplier) || fFarClipMinMultiplier <= 0.0f)
+        fFarClipMinMultiplier = 1.0f;
+    if (!std::isfinite(fFarClipMaxMultiplier) || fFarClipMaxMultiplier < fFarClipMinMultiplier)
+        fFarClipMaxMultiplier = fFarClipMinMultiplier;
+    if (!std::isfinite(fFarClipHeightFactor)) fFarClipHeightFactor = 0.0f;
+    if (!std::isfinite(fFarClipMultiplier)) fFarClipMultiplier = 1.0f;
+    fEffectiveFarClipMultiplier = fFarClipMultiplier == 0.0f ?
+        fFarClipMinMultiplier : fFarClipMultiplier;
     GetMemoryAddresses();
     ApplyMemoryPatches();
 }

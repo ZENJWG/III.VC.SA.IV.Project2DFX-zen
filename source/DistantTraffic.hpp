@@ -170,6 +170,9 @@ namespace DistantTraffic
         // distinguish hash collisions without allocating a list for each cell.
         static constexpr size_t NoCar = size_t(-1);
         std::vector<size_t> cells, nextCell;
+        // Stable for one simulation step: BuildCells snapshots positions before
+        // neighbour queries and movement is committed only at the end.
+        std::vector<int> cellX, cellY;
         size_t densityCursor = 0;
         static unsigned LocalLimit(const Edge& edge, const CVector& position)
         {
@@ -190,11 +193,11 @@ namespace DistantTraffic
                 // zone queries per tick, not one query per visible car/frame.
                 for (size_t n = 0; n < (std::min)(cars.size(), size_t(16)); ++n)
                 {
-                    auto& car = cars[densityCursor++ % cars.size()];
+                    const size_t i = densityCursor++ % cars.size();
+                    auto& car = cars[i];
                     if (!car.m_bActive || car.retiring || car.m_bWaterNode) continue;
                     unsigned limit = LocalLimit(car.entry, car.m_vecPos), nearby = 0;
-                    int x = static_cast<int>(std::floor(car.m_vecPos.x / 40.0f));
-                    int y = static_cast<int>(std::floor(car.m_vecPos.y / 40.0f));
+                    const int x = cellX[i], y = cellY[i];
                     for (int dx = -2; dx <= 2; ++dx)
                         for (int dy = -2; dy <= 2; ++dy)
                         {
@@ -224,7 +227,9 @@ namespace DistantTraffic
         void InsertCell(size_t i)
         {
             const auto& p = cars[i].m_vecPos;
-            int64_t key = Cell(static_cast<int>(std::floor(p.x / 40.0f)), static_cast<int>(std::floor(p.y / 40.0f)));
+            cellX[i] = static_cast<int>(std::floor(p.x / 40.0f));
+            cellY[i] = static_cast<int>(std::floor(p.y / 40.0f));
+            int64_t key = Cell(cellX[i], cellY[i]);
             size_t bucket = Bucket(key);
             cellKeys[i] = key;
             nextCell[i] = cells[bucket];
@@ -239,6 +244,8 @@ namespace DistantTraffic
             std::fill(cells.begin(), cells.end(), NoCar);
             nextCell.resize(cars.size());
             cellKeys.resize(cars.size());
+            cellX.resize(cars.size());
+            cellY.resize(cars.size());
             // Keep neighbours in pool order, as in the original cell lists.
             for (size_t i = cars.size(); i-- > 0;)
                 if (cars[i].m_bActive)
@@ -504,8 +511,7 @@ namespace DistantTraffic
                     {
                         const auto& car = cars[i];
                         if (!car.m_bActive || car.m_bWaterNode || advances[i] == 0) continue;
-                        int x = static_cast<int>(std::floor(car.m_vecPos.x / 40.0f));
-                        int y = static_cast<int>(std::floor(car.m_vecPos.y / 40.0f));
+                        const int x = cellX[i], y = cellY[i];
                         for (int dx = -1; dx <= 1 && advances[i] > 0; ++dx)
                             for (int dy = -1; dy <= 1 && advances[i] > 0; ++dy)
                             {
@@ -532,8 +538,7 @@ namespace DistantTraffic
             {
                 const auto& car = cars[i];
                 if (!car.m_bActive || car.m_bWaterNode || advances[i] == 0) continue;
-                int x = static_cast<int>(std::floor(car.m_vecPos.x / 40.0f));
-                int y = static_cast<int>(std::floor(car.m_vecPos.y / 40.0f));
+                const int x = cellX[i], y = cellY[i];
                 bool blocked = false;
                 for (int dx = -1; dx <= 1 && !blocked; ++dx)
                     for (int dy = -1; dy <= 1 && !blocked; ++dy)
@@ -631,8 +636,7 @@ namespace DistantTraffic
                 {
                     const auto& car = cars[i];
                     if (!car.m_bActive || car.m_bWaterNode) continue;
-                    int x = static_cast<int>(std::floor(car.m_vecPos.x / 40.0f));
-                    int y = static_cast<int>(std::floor(car.m_vecPos.y / 40.0f));
+                    const int x = cellX[i], y = cellY[i];
                     for (int dx = -1; dx <= 1; ++dx)
                         for (int dy = -1; dy <= 1; ++dy)
                         {
@@ -702,8 +706,7 @@ namespace DistantTraffic
                 unsigned queuedAhead = 0;
                 // Read one snapshot and apply all movement afterwards. Followers
                 // slow BEFORE moving; they are never pushed backwards to make room.
-                int x = static_cast<int>(std::floor(car.m_vecPos.x / 40.0f));
-                int y = static_cast<int>(std::floor(car.m_vecPos.y / 40.0f));
+                const int x = cellX[i], y = cellY[i];
                 for (int dx = -1; dx <= 1; ++dx)
                     for (int dy = -1; dy <= 1; ++dy)
                     {
@@ -716,6 +719,9 @@ namespace DistantTraffic
                             CVector delta = other.m_vecPos - car.m_vecPos;
                             if (std::abs(delta.z) > 3.0f || car.m_bWaterNode != other.m_bWaterNode)
                                 continue;
+                            // Compute once per candidate pair; intersection and yield tests
+                            // previously repeated the same squared-distance calculation.
+                            const float separationSq = delta.MagnitudeSqr2D();
                             auto sameLane = [](const Edge& a, unsigned laneA, const Edge& b, unsigned laneB)
                             { return a.from == b.from && a.to == b.to && laneA == laneB; };
                             bool sameEntry = sameLane(car.entry, car.lane, other.entry, other.lane);
@@ -743,7 +749,7 @@ namespace DistantTraffic
                                     other.speed < (std::max)(1.0f, other.cruise * .25f))
                                     ++queuedAhead;
                             }
-                            if (!AvoidCongestion && !(sameEntry && sameExit) && !car.m_bWaterNode && delta.MagnitudeSqr2D() < 400.0f &&
+                            if (!AvoidCongestion && !(sameEntry && sameExit) && !car.m_bWaterNode && separationSq < 400.0f &&
                                 other.m_nCoronaId < car.m_nCoronaId &&
                                 Overlap(lookPositions[i], lookDirections[i], lookPositions[j], lookDirections[j]))
                                 desired = 0.0f;
@@ -778,7 +784,7 @@ namespace DistantTraffic
                                 if (sameEntry || sameLane(car.entry, car.lane, other.exit, other.exitLane) ||
                                     sameLane(car.exit, car.exitLane, other.entry, other.lane))
                                     continue; // A car clearing the link never yields to its own queue.
-                                if (!car.m_bWaterNode && delta.MagnitudeSqr2D() < 3600.0f)
+                                if (!car.m_bWaterNode && separationSq < 3600.0f)
                                 {
                                     size_t first = 6, otherFirst = 6;
                                     for (size_t a = 0; a < yieldCount[i]; ++a)
@@ -926,6 +932,8 @@ namespace DistantTraffic
             }
             nextCell.reserve(capacity);
             cellKeys.reserve(capacity);
+            cellX.reserve(capacity);
+            cellY.reserve(capacity);
             size_t buckets = 1;
             while (buckets < capacity * 2)
                 buckets *= 2;
@@ -962,6 +970,8 @@ namespace DistantTraffic
                 return;
             if (!std::isfinite(dt) || dt <= 0)
                 return;
+            const float farClipSq = farClip * farClip;
+            const float retireClipSq = (farClip + 300.0f) * (farClip + 300.0f);
             size_t active = 0;
             for (const auto& car : cars)
                 if (car.m_bActive && !car.retiring)
@@ -974,7 +984,7 @@ namespace DistantTraffic
                 float dist = (car.m_vecPos - camera).MagnitudeSqr2D();
                 // Density changes only retire hidden traffic; visible queues keep
                 // their identities. Off-map cars eventually free slots for new areas.
-                if (dist > (farClip + 300) * (farClip + 300) || (active > desired && (dist < 120 * 120 || dist > farClip * farClip)))
+                if (dist > retireClipSq || (active > desired && (dist < 120 * 120 || dist > farClipSq)))
                 {
                     car.retiring = true;
                     --active;
