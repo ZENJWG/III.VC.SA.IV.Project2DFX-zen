@@ -1,30 +1,3 @@
-Project2DFX - Zeneric Edition
-Updated: 2026-10-19
-
-This modified version was done by Zeneric.
-Original Project2DFX authors and contributors retain their credit.
-
-GTA San Andreas - Draw Distance and Models
-- Expanded normal, generic, vegetation, LOD, timed, neon and IsBigBuilding
-  draw-distance support; corrected overlapping distance settings.
-- Added animated-clump distance control and optional interior-model coverage.
-- Improved IDE model classification and loader hooks to include more models.
-- Added opt-in preloading for normal, timed, vegetation, generic, neon,
-  big-building, animated and all-LOD models, with deduplication and limits.
-
-Rendering and Performance
-- Added experimental optional D3D9 GPU distant-car transforms/lighting and
-  instanced distant-light quads (both off by default).
-- Reduced distant-light culling work, traffic calculations and lamp searches;
-  improved adaptive far-clip updates and runtime safety.
-
-Notes
-- Preloading may increase RAM/VRAM usage and load times.
-- New preload and experimental GPU options default OFF.
-  
-
-
-
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ThirteenAG/III.VC.SA.IV.Project2DFX/main.yml?branch=master&label=GitHub%20Actions%20Build&logo=GitHub)](https://github.com/ThirteenAG/III.VC.SA.IV.Project2DFX/actions/workflows/main.yml)
 
 <div align="center">
