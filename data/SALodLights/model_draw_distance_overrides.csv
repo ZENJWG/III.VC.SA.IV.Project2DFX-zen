@@ -1,0 +1,4 @@
+# Optional per-model ABSOLUTE draw distance (GTA SA 1.0 US)
+# model_id,distance
+# 1234,1200.0
+# Overrides take precedence over normal/generic/veg/LOD/timed/big-building settings.

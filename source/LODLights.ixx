@@ -7,6 +7,7 @@
 #include "CoronaRenderMath.hpp"
 #ifdef PROJECT2DFX_SA
 #include "SALodLights/GpuD3D9.hpp"
+#include "SALodLights/SAFeaturePolicy.hpp"
 #endif
 
 export module LODLights;
@@ -634,6 +635,13 @@ public:
         const float farPlane = Scene->m_pRwCamera->farPlane;
         const CVector* pCamPos = GetCamPos();
         const float fogyness = CWeather::Foggyness;
+#ifdef PROJECT2DFX_SA
+        const float weatherFactor = bSaWeatherIntegration ?
+            SAFeaturePolicy::WeatherLight(
+                static_cast<float>(CWeather::Rain), fogyness) : 1.0f;
+#else
+        constexpr float weatherFactor = 1.0f;
+#endif
         const float screenWidth = static_cast<float>(nWidth);
         const float screenHeight = static_cast<float>(nHeight);
         const float depthNearScreenZ = *CSprite::m_f2DNearScreenZ;
@@ -763,7 +771,8 @@ public:
             // 0x7C00xxxx is reserved for lamps attached to distant vehicle meshes.
             // Their opacity already includes the model's distance/envelope/fog fade.
             const float fadeFactor = !modelLamp && vecTransformedCoords.z > halfRange ? 1.0f - (vecTransformedCoords.z - halfRange) / halfRange : 1.0f;
-            const short fadeIntensity = static_cast<short>(corona.Intensity * fadeFactor);
+            const short fadeIntensity = static_cast<short>(
+                (std::min)(255.0f, corona.Intensity * fadeFactor * weatherFactor));
             // Zero intensity contributes no additive pixels; do not touch a batch.
             if (fadeIntensity == 0)
                 continue;

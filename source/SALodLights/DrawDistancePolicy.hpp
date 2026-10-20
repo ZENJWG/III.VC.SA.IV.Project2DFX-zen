@@ -94,7 +94,17 @@ namespace DrawDistancePolicy
         return best;
     }
 
-    // Compatibility overload for old callers and tests.
+    // Normal-world scanning must include explicit per-model overrides, even
+    // for interiors excluded from category-wide draw-distance adjustments.
+    inline bool NeedsNormalScanExtension(float original, float adjusted,
+                                         bool excludedInterior) noexcept
+    {
+        return std::isfinite(original) && original > 0.0f &&
+            original <= 300.0f && std::isfinite(adjusted) &&
+            adjusted > 0.0f && (!excludedInterior || adjusted > original);
+    }
+
+    // Legacy convenience API used by compatibility tests and external integrations.
     inline float Object(float original, int id, bool interior, float lod,
                         float generic, float allNormal, float vegetation) noexcept
     {

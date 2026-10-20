@@ -4,21 +4,64 @@ Updated: 2026-10-19
 This modified version was done by Zeneric.
 Original Project2DFX authors and contributors retain their credit.
 
-GTA San Andreas - Draw Distance and Models
-- Expanded normal, generic, vegetation, LOD, timed, neon and IsBigBuilding
-  draw-distance support; corrected overlapping distance settings.
-- Added animated-clump distance control and optional interior-model coverage.
-- Improved IDE model classification and loader hooks to include more models.
-- Added opt-in preloading for normal, timed, vegetation, generic, neon,
-  big-building, animated and all-LOD models, with deduplication and limits.
+GTA SA: projected distant-vehicle headlights
+- Added terrain-following, softly faded road headlight patches for distant cars
+  (night/dusk only); boats are excluded.
+- Collision samples stop beams at missing ground, steep edges and height jumps,
+  with bounded per-frame work and reusable caches.
+- Added optional INI limits, source/policy tests and setup notes.
+- SkyGFX shaders and existing GPU rendering options remain unchanged.
 
-Rendering and Performance
-- Added experimental optional D3D9 GPU distant-car transforms/lighting and
-  instanced distant-light quads (both off by default).
-- Reduced distant-light culling work, traffic calculations and lamp searches;
-  improved adaptive far-clip updates and runtime safety.
+GTA SA source audit / optimization Pass 9
+- Fixed early/unbounded preload traversal edge cases and malformed traffic inputs.
+- Guarded vehicle ground-alignment math and zero-direction interpolation.
+- Kept distant traffic hidden when fog camera data is invalid; cleaned up lingering
+  vehicle lights when the traffic pool is empty.
+- Removed duplicate corona cleanup/hook writes and empty preprocessor code.
+- Added focused regressions and SA_AUDIT_PASS9.md; no existing INI settings changed.
 
-Notes
-- Preloading may increase RAM/VRAM usage and load times.
-- New preload and experimental GPU options default OFF.
-- Full VS2026 and in-game compatibility/performance testing is not verified.
+GTA SA distant traffic and SkyGFX atmosphere update
+- Added stable neighborhood traffic-density variation and realistic, varied
+  per-lane spacing for cars; boats retain safe waterway gaps.
+- Faded distant cars, boats and their coronas with camera/weather fog plus an
+  adjustable maximum visibility range, including optional GPU render paths.
+- Kept off-screen/fog-hidden simulation bounded and density-proportional,
+  reducing needless distant traffic work.
+- Added INI controls, tests and setup notes; no SkyGFX shader changes.
+
+
+Daytime vehicle lighting fix - GTA San Andreas
+- Kept distant cars visible as 3D meshes during daylight instead of far-distance
+  headlight/taillight corona impostors; restored normal night transitions.
+- Disabled car and boat navigation coronas in full daylight, with smooth
+  sunrise/sunset fading and cleanup of stale sprites.
+- Added DistantVehicleNightLightsOnly=1 (default); legacy lighting remains
+  selectable with 0. No SkyGFX or GPU rendering features were disabled.
+
+Pass 8 hotfix - Visual Studio 2026
+- Fixed GTA SA build errors C4002/C2589 caused by the legacy Clamp macro
+  colliding with SAFeaturePolicy; added a compiler regression test.
+
+Pass 8 - GTA SA visuals and distance-aware rendering
+- Added optional linked-LOD streaming lead-in (not a building-mesh crossfade).
+- Added stable 4-shape distant-car variants, low-polygon middle distance, and smooth 3D-to-corona blending.
+- Added native weather/fog light adjustment compatible with existing RW/SkyGFX rendering.
+- Added smooth rush-hour/night traffic density profiles and validated INI controls.
+- Extended tests for profile interpolation, silhouette stability, mesh indices and LOD quality boundaries.
+
+Pass 7 - Whole-project bug fixes and optimizations
+- Fixed zero-lane traffic spawning, non-finite simulation inputs, and local traffic-density counting.
+- Cached per-vehicle interpolated positions/directions in GTA III, VC, and SA.
+- Replaced expensive full-map light scans with keyed lookups in III, VC, and IV.
+- Protected III/VC swapped-model light registration and IV invalid quaternion rotations.
+- Hardened 2DFXDataGrabber parsing against buffer overwrites, partial records and malformed delimiters.
+- Improved GTA SA scanning distance for explicit interior model overrides; added regression tests.
+
+Earlier Zeneric updates
+- Expanded SA IDE/LOD/big-building draw distances with optional per-model CSV overrides.
+- Added capped, incremental model preloading and adaptive far-clip corrections.
+- Added opt-in D3D9 GPU car/light paths, shader/resource fixes and SkyGFX state handling.
+- Added VS2026 ZIP build and dependency restoration.
+
+Verification: standalone tests pass. Complete VS2026 builds, in-game FPS and
+SkyGFX stability still require testing on Windows.

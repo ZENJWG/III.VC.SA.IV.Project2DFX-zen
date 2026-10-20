@@ -491,7 +491,8 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
         if (impostor.m_bWaterNode && !bDistantMaritimeTraffic)
             continue;
 
-        CVector toImpostor = simulation.RenderPosition(impostor) - camPos;
+        const CVector renderPos = simulation.RenderPosition(impostor);
+        const CVector toImpostor = renderPos - camPos;
         float distSqr = toImpostor.MagnitudeSqr2D();
         if (distSqr < SQR(140.0f) || distSqr > SQR(maxDist))
             continue;
@@ -500,7 +501,9 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
         if (dist < 0.001f)
             continue;
 
-        float dirDot = DotProduct(simulation.RenderDirection(impostor), camPos - simulation.RenderPosition(impostor));
+        const CVector renderDir = simulation.RenderDirection(impostor);
+
+        float dirDot = DotProduct(renderDir, camPos - renderPos);
         bool approaching = dirDot > 0.0f;
 
         uint8 red, green, blue;
@@ -523,7 +526,7 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
         float fadeNear = Clamp((dist * nearScale - 140.0f) / 120.0f, 0.0f, 1.0f);
         float fade = fadeFar * fadeNear;
 
-        if (models.Add(simulation.RenderPosition(impostor), simulation.RenderDirection(impostor), impostor.m_visual, impostor.m_nCoronaId, fade, impostor.m_bWaterNode))
+        if (models.Add(renderPos, renderDir, impostor.m_visual, impostor.m_nCoronaId, fade, impostor.m_bWaterNode))
             continue;
 
         float size = 4.0f * fDistantCarsRadiusMultiplier;
@@ -537,13 +540,13 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
         CVector portPos, stbdPos;
         if (impostor.m_bWaterNode)
         {
-            float toCamX = camPos.x - simulation.RenderPosition(impostor).x;
-            float toCamY = camPos.y - simulation.RenderPosition(impostor).y;
+            float toCamX = camPos.x - renderPos.x;
+            float toCamY = camPos.y - renderPos.y;
             float toCamLen = Sqrt(toCamX * toCamX + toCamY * toCamY);
             if (toCamLen > 0.001f)
             {
-                float fwd = (simulation.RenderDirection(impostor).x * toCamX + simulation.RenderDirection(impostor).y * toCamY) / toCamLen;
-                boatCross = simulation.RenderDirection(impostor).x * toCamY - simulation.RenderDirection(impostor).y * toCamX;
+                float fwd = (renderDir.x * toCamX + renderDir.y * toCamY) / toCamLen;
+                boatCross = renderDir.x * toCamY - renderDir.y * toCamX;
 
                 // Sidelights cover from dead ahead to 22.5° abaft the beam.
                 constexpr float SECTOR_EDGE = -0.38f; // cos(112.5°)
@@ -560,10 +563,10 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
                 // bow so red and green are clearly separated and never wash
                 // out against the white masthead light.
                 const float beamHalf = 2.0f;
-                portPos = simulation.RenderPosition(impostor) +
-                          CVector(-simulation.RenderDirection(impostor).y * beamHalf, simulation.RenderDirection(impostor).x * beamHalf, 0.0f);
-                stbdPos = simulation.RenderPosition(impostor) +
-                          CVector(simulation.RenderDirection(impostor).y * beamHalf, -simulation.RenderDirection(impostor).x * beamHalf, 0.0f);
+                portPos = renderPos +
+                          CVector(-renderDir.y * beamHalf, renderDir.x * beamHalf, 0.0f);
+                stbdPos = renderPos +
+                          CVector(renderDir.y * beamHalf, -renderDir.x * beamHalf, 0.0f);
             }
         }
         if (alpha == 0 && sideAlpha == 0)
@@ -571,7 +574,7 @@ static void RenderTraffic(Simulation& simulation, DistantCarRenderer::Frame& mod
 
         if (alpha)
         {
-            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, simulation.RenderPosition(impostor), size, maxDist, 1, 0, false,
+            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, renderPos, size, maxDist, 1, 0, false,
                                        false, 0, 0.0f, false, 0.0f, 0, 255.0f, false, false);
         }
 

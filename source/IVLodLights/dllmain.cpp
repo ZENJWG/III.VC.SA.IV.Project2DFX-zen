@@ -1,6 +1,7 @@
 ﻿#include "stdafx.h"
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <cmath>
 #include <ranges>
 
 import CoronaLimit;
@@ -91,14 +92,11 @@ void RegisterCustomCoronas()
 {
     constexpr unsigned int nModelID = 0xFFFFFFFF;
 
-    auto foundElements = FileContentMMap | std::views::filter([&nModelID](auto& v)
+    const auto [first, last] = FileContentMMap.equal_range(nModelID);
+    for (auto it = first; it != last; ++it)
     {
-        return v.first == nModelID;
-    });
-
-    for (auto& it : foundElements)
-    {
-        m_Lampposts.push_back(CLamppostInfo(it.second.vecLocalPos, { 0.0f, 0.0f, 0.0f }, it.second.colour, it.second.fCustomSizeMult, it.second.nCoronaShowMode, it.second.nNoDistance, it.second.nDrawSearchlight, 0.0f, 0.0f, it.second.pPredicate));
+        const auto& data = it->second;
+        m_Lampposts.push_back(CLamppostInfo(data.vecLocalPos, { 0.0f, 0.0f, 0.0f }, data.colour, data.fCustomSizeMult, data.nCoronaShowMode, data.nNoDistance, data.nDrawSearchlight, 0.0f, 0.0f, data.pPredicate));
     }
 }
 
@@ -112,7 +110,12 @@ void RegisterLamppost(WplInstance* pObj)
     float qy = pObj->RotationY;
     float qz = pObj->RotationZ;
 
-    float n = 1.0f / sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+    // Corrupt/zero-length WPL quaternions must not introduce NaNs into
+    // the light transform (and thus into the camera-culling calculations).
+    const float quaternionLengthSq = qx * qx + qy * qy + qz * qz + qw * qw;
+    if (!std::isfinite(quaternionLengthSq) || quaternionLengthSq < 1.0e-12f)
+        return;
+    float n = 1.0f / sqrt(quaternionLengthSq);
     qx *= n;
     qy *= n;
     qz *= n;
@@ -142,15 +145,13 @@ void RegisterLamppost(WplInstance* pObj)
             return;
     }
 
-    auto foundElements = FileContentMMap | std::views::filter([&nModelID](auto& v)
-    {
-        return v.first == nModelID;
-    });
-
+    // std::multimap keeps identical model hashes adjacent.
+    const auto [first, last] = FileContentMMap.equal_range(nModelID);
     float heading = atan2(dummyMatrix.GetUp().y, -dummyMatrix.GetUp().x);
-    for (auto& it : foundElements)
+    for (auto it = first; it != last; ++it)
     {
-        m_Lampposts.push_back(CLamppostInfo(dummyMatrix * it.second.vecLocalPos, it.second.vecLocalPos, it.second.colour, it.second.fCustomSizeMult, it.second.nCoronaShowMode, it.second.nNoDistance, it.second.nDrawSearchlight, heading, it.second.fObjectDrawDistance, it.second.pPredicate));
+        const auto& data = it->second;
+        m_Lampposts.push_back(CLamppostInfo(dummyMatrix * data.vecLocalPos, data.vecLocalPos, data.colour, data.fCustomSizeMult, data.nCoronaShowMode, data.nNoDistance, data.nDrawSearchlight, heading, data.fObjectDrawDistance, data.pPredicate));
     }
 }
 

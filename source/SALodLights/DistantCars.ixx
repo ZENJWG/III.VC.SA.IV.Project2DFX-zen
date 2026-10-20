@@ -2,6 +2,7 @@ module;
 
 #include <stdafx.h>
 #include "../DistantTraffic.hpp"
+#include "SAFeaturePolicy.hpp"
 
 export module DistantCars;
 
@@ -374,45 +375,93 @@ void CMovingThings::UpdateDistantCarImpostors()
 {
     CVector camera = TheCamera->GetCoords();
     float farClip = CTimeCycle::m_fCurrentFarClip;
-    if (bExtendImpostorPathStreaming && MakeRequestForNodesToBeLoaded)
-        MakeRequestForNodesToBeLoaded(ThePaths.get_ptr(), nullptr, camera.x - farClip, camera.x + farClip, camera.y - farClip, camera.y + farClip);
+    // Streaming and simulation share the same fog-aware range; the extra
+    // 250-metre ring keeps path nodes warm as weather and the camera move.
+    const float simulationClip = bSaTrafficFogFade ?
+        SAFeaturePolicy::TrafficSimulationRange(farClip,
+            static_cast<float>(CWeather::Foggyness),
+            fSaTrafficHeavyFogVisibility, fSaTrafficMaxVisibility) : farClip;
+    if (bExtendImpostorPathStreaming && MakeRequestForNodesToBeLoaded && simulationClip > 0.0f)
+        MakeRequestForNodesToBeLoaded(ThePaths.get_ptr(), nullptr,
+            camera.x - simulationClip, camera.x + simulationClip,
+            camera.y - simulationClip, camera.y + simulationClip);
     float density = (std::clamp)(static_cast<float>(CCarCtrl::CarDensityMultiplier), 0.0f, 1.0f);
-    int hour = CClock::ms_nGameClockHours;
-    if (hour <= 5)
+    const float hour = static_cast<float>(CClock::ms_nGameClockHours) +
+        static_cast<float>(CClock::ms_nGameClockMinutes) / 60.0f;
+    if (bSaTrafficProfiles)
+        density *= SAFeaturePolicy::TrafficMultiplier(
+            hour, fSaRushHourTrafficMultiplier, fSaNightTrafficMultiplier);
+    else if (hour < 6.0f)
         density *= .65f;
     density *= 1.0f - .22f * static_cast<float>(CWeather::Rain);
     density *= 1.0f - .16f * static_cast<float>(CWeather::Foggyness);
+    if (bSaTrafficFogFade && simulationClip < farClip)
+        density *= SAFeaturePolicy::TrafficPopulationScale(simulationClip, farClip);
+    traffic.SetSpawnVariation(fSaTrafficSpatialVariation, fSaTrafficSpacingVariation);
     traffic.SetSignals(CTrafficLights::StopForCars(1), CTrafficLights::StopForCars(2));
-    traffic.Update(CTimer::GetTimeStepInSeconds(), static_cast<size_t>((std::clamp)(nNumDistantCarImpostors, 0, 10000)), density, camera, farClip);
+    traffic.Update(CTimer::GetTimeStepInSeconds(), static_cast<size_t>((std::clamp)(nNumDistantCarImpostors, 0, 10000)), density, camera, simulationClip);
 }
 
 void CMovingThings::RenderDistantCarImpostors()
 {
-    if (nNumDistantCarImpostors <= 0 || aDistantCarImpostors.empty())
-        return;
-
+    // Construct the frame even when the pool is empty. Its constructor
+    // retires last frame's 3D vehicle coronas; otherwise they can linger
+    // after disabling traffic or loading a save with zero active slots.
     CVector camPos = TheCamera->GetCoords();
     float maxDist = CTimeCycle::m_fCurrentFarClip;
     DistantCarRenderer::Frame models(camPos, maxDist);
+    if (nNumDistantCarImpostors <= 0 || aDistantCarImpostors.empty())
+        return;
+    const auto* rwCam = Scene->m_pRwCamera;
+    const float fogStart = rwCam ? rwCam->fogPlane : maxDist;
+    const float fogEnd = rwCam ? rwCam->farPlane : maxDist;
+    const float weatherFog = static_cast<float>(CWeather::Foggyness);
 
     float nearScale = DistantTraffic::ViewDistanceScale(TheCamera->Cams[TheCamera->ActiveCam].FOV);
+    const float hour = static_cast<float>(CClock::ms_nGameClockHours) +
+        static_cast<float>(CClock::ms_nGameClockMinutes) / 60.0f;
+    const float nightFactor = bSaNightVehicleLightsOnly ?
+        SAFeaturePolicy::NightVehicleLightFactor(hour) : 1.0f;
     for (auto& impostor : aDistantCarImpostors)
     {
         if (!impostor.m_bActive)
             continue;
 
         if (impostor.m_bWaterNode && !bDistantMaritimeTraffic)
+        {
+            TrafficGraph::Hide(impostor.m_nCoronaId);
             continue;
+        }
 
-        float distSqr = (traffic.RenderPosition(impostor) - camPos).MagnitudeSqr2D();
+        const CVector renderPos = traffic.RenderPosition(impostor);
+        const CVector toImpostor = renderPos - camPos;
+        float distSqr = toImpostor.MagnitudeSqr2D();
         if (distSqr < SQR(140.0f) || distSqr > SQR(maxDist))
+        {
+            TrafficGraph::Hide(impostor.m_nCoronaId);
             continue;
+        }
 
         float dist = Sqrt(distSqr);
         if (dist < 0.001f)
             continue;
+        // Use 3D distance for fog: aerial views otherwise leave black traffic
+        // dots visible through SkyGFX's dense haze. This alpha is shared by
+        // mesh, optional GPU draw and classic corona branches.
+        const float fogDistance = toImpostor.Magnitude();
+        const float fogVisibility = bSaTrafficFogFade ?
+            SAFeaturePolicy::TrafficFogVisibility(fogDistance, fogStart,
+                fogEnd, weatherFog, fSaTrafficHeavyFogVisibility,
+                fSaTrafficMaxVisibility) : 1.0f;
+        if (fogVisibility <= 0.001f)
+        {
+            TrafficGraph::Hide(impostor.m_nCoronaId);
+            continue;
+        }
 
-        bool approaching = DotProduct(traffic.RenderDirection(impostor), camPos - traffic.RenderPosition(impostor)) > 0.0f;
+        const CVector renderDir = traffic.RenderDirection(impostor);
+
+        bool approaching = DotProduct(renderDir, camPos - renderPos) > 0.0f;
 
         uint8 red, green, blue;
         if (impostor.m_bWaterNode)
@@ -429,10 +478,42 @@ void CMovingThings::RenderDistantCarImpostors()
             green = approaching ? 255 : 40;
             blue = approaching ? 230 : 40;
         }
-        float fade = Clamp((maxDist - dist) / 250.0f, 0.0f, 1.0f) * Clamp((dist * nearScale - 140.0f) / 120.0f, 0.0f, 1.0f);
+        float fade = Clamp((maxDist - dist) / 250.0f, 0.0f, 1.0f) *
+            Clamp((dist * nearScale - 140.0f) / 120.0f, 0.0f, 1.0f) *
+            fogVisibility;
 
-        if (models.Add(traffic.RenderPosition(impostor), traffic.RenderDirection(impostor), impostor.m_visual, impostor.m_nCoronaId, fade, impostor.m_bWaterNode))
+        // Fade the 3D body into its existing corona impostor over a distance
+        // band, without spawning an extra simulated car or light ID.
+        float impostorMix = 0.0f;
+        if (bSaDistanceQuality && !impostor.m_bWaterNode)
+            impostorMix = SAFeaturePolicy::NightVehicleImpostorMix(
+                dist, SAFeaturePolicy::ClampFinite(fSaTrafficFarDistance,
+                fSaTrafficMediumDistance + 40.0f, 10000.0f, 700.0f),
+                fSaTrafficTransitionBand, nightFactor);
+        const bool meshHandled = models.Add(renderPos, renderDir,
+            impostor.m_visual, impostor.m_nCoronaId,
+            fade * (1.0f - impostorMix), impostor.m_bWaterNode);
+        if (meshHandled && impostorMix <= 0.001f)
             continue;
+        if (meshHandled)
+            fade *= impostorMix; // Night factor already included in the blend.
+        else
+            fade *= nightFactor;
+
+        // Unlike a vehicle body, a headlight or boat navigation light must
+        // not masquerade as the whole vehicle at midday. The 3D renderer
+        // applies the same night factor to its own lamps.
+        if (fade <= 0.0f)
+        {
+            CLODLights::UnregisterCorona(impostor.m_nCoronaId);
+            if (impostor.m_bWaterNode)
+            {
+                const uint32 baseId = impostor.m_nCoronaId - 0x7F000000u;
+                CLODLights::UnregisterCorona(ImpostorPortSideCoronaId((int32)baseId));
+                CLODLights::UnregisterCorona(ImpostorStarboardSideCoronaId((int32)baseId));
+            }
+            continue;
+        }
 
         float size = 4.0f * fDistantCarsRadiusMultiplier;
         fade *= impostor.m_visual.fade;
@@ -445,13 +526,13 @@ void CMovingThings::RenderDistantCarImpostors()
         CVector portPos, stbdPos;
         if (impostor.m_bWaterNode)
         {
-            float toCamX = camPos.x - traffic.RenderPosition(impostor).x;
-            float toCamY = camPos.y - traffic.RenderPosition(impostor).y;
+            float toCamX = camPos.x - renderPos.x;
+            float toCamY = camPos.y - renderPos.y;
             float toCamLen = Sqrt(toCamX * toCamX + toCamY * toCamY);
             if (toCamLen > 0.001f)
             {
-                float fwd = (traffic.RenderDirection(impostor).x * toCamX + traffic.RenderDirection(impostor).y * toCamY) / toCamLen;
-                boatCross = traffic.RenderDirection(impostor).x * toCamY - traffic.RenderDirection(impostor).y * toCamX;
+                float fwd = (renderDir.x * toCamX + renderDir.y * toCamY) / toCamLen;
+                boatCross = renderDir.x * toCamY - renderDir.y * toCamX;
 
                 // Sidelights cover from dead ahead to 22.5° abaft the beam.
                 constexpr float SECTOR_EDGE = -0.38f; // cos(112.5°)
@@ -468,21 +549,36 @@ void CMovingThings::RenderDistantCarImpostors()
                 // bow so red and green are clearly separated and never wash
                 // out against the white masthead light.
                 const float beamHalf = 2.0f;
-                portPos = traffic.RenderPosition(impostor) +
-                          CVector(-traffic.RenderDirection(impostor).y * beamHalf, traffic.RenderDirection(impostor).x * beamHalf, 0.0f);
-                stbdPos = traffic.RenderPosition(impostor) +
-                          CVector(traffic.RenderDirection(impostor).y * beamHalf, -traffic.RenderDirection(impostor).x * beamHalf, 0.0f);
+                portPos = renderPos +
+                          CVector(-renderDir.y * beamHalf, renderDir.x * beamHalf, 0.0f);
+                stbdPos = renderPos +
+                          CVector(renderDir.y * beamHalf, -renderDir.x * beamHalf, 0.0f);
             }
         }
         if (alpha == 0 && sideAlpha == 0)
+        {
+            TrafficGraph::Hide(impostor.m_nCoronaId);
             continue;
+        }
 
         if (alpha)
         {
-            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, traffic.RenderPosition(impostor), size, maxDist, 1, 0, false,
+            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, renderPos, size, maxDist, 1, 0, false,
                                        false, 0, 0.0f, false, 0.0f, 0, 255.0f, false, false);
         }
 
+        else
+            CLODLights::UnregisterCorona(impostor.m_nCoronaId);
+
+        if (impostor.m_bWaterNode)
+        {
+            const uint32 baseId = impostor.m_nCoronaId - 0x7F000000u;
+            // Remove lights on a side that is no longer facing the camera.
+            if (!sideAlpha || boatCross < 0.0f)
+                CLODLights::UnregisterCorona(ImpostorPortSideCoronaId((int32)baseId));
+            if (!sideAlpha || boatCross > 0.0f)
+                CLODLights::UnregisterCorona(ImpostorStarboardSideCoronaId((int32)baseId));
+        }
         if (impostor.m_bWaterNode && sideAlpha)
         {
             uint32 baseId = impostor.m_nCoronaId - 0x7F000000u;

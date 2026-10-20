@@ -1,9 +1,15 @@
-﻿module;
+module;
 
 #include <stdafx.h>
 #include <cmath>
 #include <type_traits>
 #include "DistantCarMesh.hpp"
+#include "DistantCarLowMesh.hpp"
+#ifdef PROJECT2DFX_SA
+#include "SALodLights/SAFeaturePolicy.hpp"
+#include "SALodLights/ProjectedHeadlightPolicy.hpp"
+#endif
+#include "SALodLights/SafeGroundProjection.hpp"
 #include "DistantBoatMesh.hpp"
 #ifdef PROJECT2DFX_SA
 #include "SALodLights/GpuD3D9.hpp"
@@ -44,6 +50,16 @@ export namespace DistantCarRenderer
         uint8_t paint = 0;
         float fade = 1.0f;
         bool dying = false;
+#ifdef PROJECT2DFX_SA
+        // Recycled with the car's simulation state. Cached *collision contacts*
+        // are never trusted after a teleport, heading change or timeout.
+        bool projectedSampled = false;
+        uint32_t projectedSampleTime = 0;
+        CVector projectedAt = { 0,0,0 };
+        CVector projectedForward = { 0,1,0 };
+        uint8_t projectedRows = 0;
+        CVector projectedContacts[ProjectedHeadlightPolicy::Rows][ProjectedHeadlightPolicy::Corners] = {};
+#endif
     };
 
     // Spawn/despawn envelope. Traffic must never appear or disappear in one
@@ -98,6 +114,7 @@ export namespace DistantCarRenderer
             uint32_t id;
             float fade, distance;
             bool boat;
+            bool lowDetail;
         };
         CVector camera;
         float farClip;
@@ -168,6 +185,178 @@ export namespace DistantCarRenderer
             state.groundHeight = (heights[0] + heights[1] + heights[2] + heights[3]) * .25f;
         }
 
+#ifdef PROJECT2DFX_SA
+        // Bounded road-surface projection; deliberately excludes boats.
+        // A quad alone bridges terrain and can light a hillside or the air.
+        // Sample each side of both beams at short intervals and terminate
+        // when collision is missing, a height jump is excessive, or a roof/
+        // overpass is found above the road path. Never request new streaming.
+        static void SampleProjectedRoad(Car& car, uint32_t now)
+        {
+            auto& state = *car.state;
+            state.projectedSampled = true;
+            state.projectedSampleTime = now;
+            state.projectedAt = car.base;
+            state.projectedForward = car.direction;
+            state.projectedRows = 0;
+            if (!CWorld::FindGroundZFor3DCoordCRGO &&
+                !CWorld::FindGroundZFor3DCoordCR) return;
+
+            CVector forward = car.direction;
+            const float horizontal = std::sqrt(forward.x * forward.x + forward.y * forward.y);
+            if (!std::isfinite(horizontal) || horizontal < .01f) return;
+            const float grade = forward.z / horizontal;
+            forward = { forward.x / horizontal, forward.y / horizontal, 0.0f };
+            const CVector right(forward.y, -forward.x, 0.0f);
+            for (int row = 0; row < ProjectedHeadlightPolicy::Rows; ++row)
+            {
+                const float ahead = ProjectedHeadlightPolicy::FirstStep +
+                    row * ProjectedHeadlightPolicy::RowStep;
+                const float radius = .25f + .125f * row;
+                const float lateral[4] = {
+                    -.72f - radius, -.72f + radius,
+                     .72f - radius,  .72f + radius
+                };
+                CVector contacts[4];
+                const float predictedZ = car.base.z + grade * ahead;
+                for (int corner = 0; corner < 4; ++corner)
+                {
+                    const CVector point = car.base + forward * ahead + right * lateral[corner];
+                    bool found = false;
+                    const float hit = CWorld::FindGroundZFor3DCoord(
+                        point.x, point.y, predictedZ + 2.3f, &found, nullptr);
+                    if (!found || !ProjectedHeadlightPolicy::AcceptHeight(hit, predictedZ))
+                        return; // missing terrain, upper deck, or lower road
+                    contacts[corner] = {point.x, point.y,
+                        hit + ProjectedHeadlightPolicy::GeometryOffset};
+                }
+                if (!ProjectedHeadlightPolicy::AcceptCross(contacts[0].z, contacts[1].z) ||
+                    !ProjectedHeadlightPolicy::AcceptCross(contacts[2].z, contacts[3].z))
+                    return; // the strip crosses a wall or raised road edge
+                if (row > 0)
+                {
+                    for (int c = 0; c < 4; ++c)
+                        if (!ProjectedHeadlightPolicy::AcceptStep(
+                                state.projectedContacts[row - 1][c].z, contacts[c].z))
+                            return; // end at a sharp crest/drop rather than bridging it
+                }
+                for (int c = 0; c < 4; ++c)
+                    state.projectedContacts[row][c] = contacts[c];
+                ++state.projectedRows;
+            }
+        }
+
+        void RenderProjectedRoadLights(uint32_t now, float hour, float lamps)
+        {
+            if (!bSaProjectedVehicleLights || nSaProjectedLightsMaxCars <= 0 ||
+                (!CWorld::FindGroundZFor3DCoordCRGO &&
+                 !CWorld::FindGroundZFor3DCoordCR) ||
+                !RwIm3DTransform || !RwIm3DRenderIndexedPrimitive || !RwIm3DEnd)
+                return;
+            const float night = SAFeaturePolicy::NightVehicleLightFactor(hour);
+            if (night <= .005f) return;
+            static DistantCarMesh::Buffer<RxObjSpace3dVertex, 1024> verts;
+            static DistantCarMesh::Buffer<short, 4096> inds;
+            verts.clear(); inds.clear();
+            int rendered = 0;
+            int refreshed = 0;
+            // cars are sorted back-to-front; consider nearest visible ones first
+            for (size_t n = cars.size(); n > 0 && rendered < nSaProjectedLightsMaxCars; --n)
+            {
+                auto& car = cars[n - 1];
+                if (car.boat || car.fade <= .08f ||
+                    car.distance > fSaProjectedLightsDistance * fSaProjectedLightsDistance)
+                    continue;
+                auto& state = *car.state;
+                const CVector previous = car.base - state.projectedAt;
+                const float positionDeltaSq = previous.MagnitudeSqr2D();
+                const CVector& oldFwd = state.projectedForward;
+                const float oldLen = std::sqrt(oldFwd.x * oldFwd.x + oldFwd.y * oldFwd.y);
+                const float newLen = std::sqrt(car.direction.x * car.direction.x +
+                                               car.direction.y * car.direction.y);
+                const float headingDot = oldLen > .001f && newLen > .001f ?
+                    (oldFwd.x * car.direction.x + oldFwd.y * car.direction.y) /
+                    (oldLen * newLen) : -1.0f;
+                const bool poseValid = state.projectedSampled &&
+                    ProjectedHeadlightPolicy::AcceptPose(positionDeltaSq, headingDot) &&
+                    std::abs(previous.z) < 1.5f;
+                const bool needsRefresh = !poseValid ||
+                    now - state.projectedSampleTime > 110u ||
+                    positionDeltaSq > .70f * .70f;
+                if (needsRefresh && refreshed < nSaProjectedLightsUpdatesPerFrame)
+                {
+                    SampleProjectedRoad(car, now);
+                    ++refreshed;
+                }
+                else if (!poseValid || now - state.projectedSampleTime > 180u)
+                    continue; // never draw an outdated projection through terrain
+                if (state.projectedRows < 2) continue;
+                if (verts.size() + state.projectedRows * 6 > 1024 ||
+                    inds.size() + (state.projectedRows - 1) * 24 > 4096)
+                    break;
+                const float intensity = car.fade * night * FogVisibility(car.base) *
+                    (std::min)(1.0f, .55f + .45f * lamps);
+                if (!(intensity > .02f) || !std::isfinite(intensity)) continue;
+                ++rendered;
+                const short baseIndex = static_cast<short>(verts.size());
+                const CVector delta = car.base - state.projectedAt;
+                for (unsigned row = 0; row < state.projectedRows; ++row)
+                {
+                    for (int beam = 0; beam < 2; ++beam)
+                    {
+                        const auto& left = state.projectedContacts[row][beam * 2];
+                        const auto& right = state.projectedContacts[row][beam * 2 + 1];
+                        // Three alpha samples across the strip create a soft beam
+                        // without a texture or a direct D3D9 shader/state change.
+                        const CVector p[3] = {left, (left + right) * .5f, right};
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            RxObjSpace3dVertex v{};
+                            const CVector at = p[c] + delta;
+                            v.objVertex = {at.x, at.y, at.z};
+                            v.objNormal = {0.0f, 0.0f, 1.0f};
+                            v.color = (uint32_t(ProjectedHeadlightPolicy::Alpha(
+                                intensity, row, c != 1)) << 24) | 0xFFF0D5u;
+                            v.u = v.v = 0.0f;
+                            verts.push_back(v);
+                        }
+                    }
+                    if (row == 0) continue;
+                    for (int beam = 0; beam < 2; ++beam)
+                    {
+                        for (int column = 0; column < 2; ++column)
+                        {
+                            const short prev = baseIndex + static_cast<short>(
+                                (row - 1) * 6 + beam * 3 + column);
+                            const short cur = prev + 6;
+                            inds.push_back(prev);
+                            inds.push_back(cur);
+                            inds.push_back(prev + 1);
+                            inds.push_back(prev + 1);
+                            inds.push_back(cur);
+                            inds.push_back(cur + 1);
+                        }
+                    }
+                }
+            }
+            if (verts.empty() || inds.empty()) return;
+            // Native RW states honor SkyGFX's deferred cache. ZTEST prevents
+            // surfaces showing through world geometry; ZWRITE stays off.
+            uintptr_t savedCull = 0;
+            RwRenderStateGet(rwRENDERSTATECULLMODE, &savedCull);
+            RwRenderStateSet(rwRENDERSTATECULLMODE,
+                             reinterpret_cast<void*>(uintptr_t(1)));
+            if (RwIm3DTransform(verts.data(), static_cast<unsigned>(verts.size()), nullptr, 0x18u))
+            {
+                RwIm3DRenderIndexedPrimitive(3, inds.data(),
+                                             static_cast<int>(inds.size()));
+                RwIm3DEnd();
+            }
+            RwRenderStateSet(rwRENDERSTATECULLMODE,
+                             reinterpret_cast<void*>(savedCull));
+        }
+#endif
+
         // Restore exactly the state we touched, including texture and fog. The
         // moving-things hook is shared with coronas/searchlights and other mods.
         struct RenderStates
@@ -219,6 +408,7 @@ export namespace DistantCarRenderer
                 size_t i = (start + n) % cars.size();
                 auto& car = cars[i];
                 auto& state = *car.state;
+                if (car.lowDetail) continue;
                 if (!state.sampled || now - state.sampleTime >= 350u ||
                     (car.base - state.samplePosition).MagnitudeSqr() > 36.0f)
                 {
@@ -229,6 +419,7 @@ export namespace DistantCarRenderer
             }
             std::sort(cars.begin(), cars.end(), [](const Car& a, const Car& b) { return a.distance > b.distance; });
             static const DistantCarMesh::Mesh carMesh;
+            static const DistantCarMesh::LowMesh lowMesh;
             static const DistantBoatMesh::Mesh boatMesh;
             static DistantCarMesh::Buffer<RxObjSpace3dVertex, 16000> vertices;
             static DistantCarMesh::Buffer<short, 24000> indices;
@@ -243,7 +434,23 @@ export namespace DistantCarRenderer
                 static_cast<float>(CClock::ms_nGameClockMinutes) / 60.0f;
             const float daylight = Saturate((hour - 5.5f) / 1.5f) *
                 Saturate((20.5f - hour) / 2.0f);
-            const float lamps = (std::max)(1.0f - daylight, static_cast<float>(CWeather::Foggyness) * .8f);
+            float lamps = (std::max)(1.0f - daylight, static_cast<float>(CWeather::Foggyness) * .8f);
+#ifdef PROJECT2DFX_SA
+            const float nightVehicleFactor = bSaNightVehicleLightsOnly ?
+                SAFeaturePolicy::NightVehicleLightFactor(hour) : 1.0f;
+#endif
+#ifdef PROJECT2DFX_SA
+            const float weatherBrightness = bSaWeatherIntegration ?
+                SAFeaturePolicy::WeatherLight(
+                    static_cast<float>(CWeather::Rain),
+                    static_cast<float>(CWeather::Foggyness)) : 1.0f;
+            lamps *= weatherBrightness;
+#endif
+#ifdef PROJECT2DFX_SA
+            const float spriteNightFactor = nightVehicleFactor;
+#else
+            const float spriteNightFactor = 1.0f;
+#endif
             const float ambient = fNightAmbient * (1.0f - daylight) + .14f * daylight + daylight * .42f;
             const float diffuse = daylight * .34f;
 
@@ -260,11 +467,18 @@ export namespace DistantCarRenderer
 #ifdef PROJECT2DFX_SA
                 if (gpuCars && !gpuVertices.empty())
                 {
-                    drawn = GpuD3D9::Instance().DrawCars(
+                    drawn = GpuD3D9::Instance().DrawCarsInstanced(
+                        carMesh,boatMesh,
                         gpuVertices.data(),static_cast<unsigned>(gpuVertices.size()),
-                        gpuIndices.data(),static_cast<unsigned>(gpuIndices.size()),
+                        static_cast<unsigned>(gpuIndices.size()),
                         gpuWorlds.data(),static_cast<unsigned>(gpuWorlds.size()),
                         ambient,diffuse,lamps);
+                    if (!drawn)
+                        drawn = GpuD3D9::Instance().DrawCars(
+                            gpuVertices.data(),static_cast<unsigned>(gpuVertices.size()),
+                            gpuIndices.data(),static_cast<unsigned>(gpuIndices.size()),
+                            gpuWorlds.data(),static_cast<unsigned>(gpuWorlds.size()),
+                            ambient,diffuse,lamps);
                     if (!drawn)
                     {
                         // Hardware path failed mid-game or during device reset:
@@ -319,7 +533,14 @@ export namespace DistantCarRenderer
             {
                 CVector position = car.base;
                 const DistantCarMesh::Geometry& mesh = car.boat ?
-                    static_cast<const DistantCarMesh::Geometry&>(boatMesh) : carMesh;
+                    static_cast<const DistantCarMesh::Geometry&>(boatMesh) :
+#ifdef PROJECT2DFX_SA
+                    (car.lowDetail && !gpuCars ?
+                        static_cast<const DistantCarMesh::Geometry&>(lowMesh) :
+                        static_cast<const DistantCarMesh::Geometry&>(carMesh));
+#else
+                    static_cast<const DistantCarMesh::Geometry&>(carMesh);
+#endif
                 CVector forward = car.direction;
                 if (car.boat)
                 {
@@ -337,20 +558,41 @@ export namespace DistantCarRenderer
                 if (!car.boat && ground.grounded && now - ground.sampleTime < 1000u &&
                    (car.base - ground.samplePosition).MagnitudeSqr() < 144.0f)
                 {
-                    up = ground.groundNormal;
-                    CVector delta = car.base - ground.samplePosition;
-                    float height = ground.groundHeight - (up.x * delta.x + up.y * delta.y) / up.z;
-                    if (std::abs(height - car.base.z) < 2.0f)
+                    const CVector delta = car.base - ground.samplePosition;
+                    float height = 0.0f;
+                    if (SafeGroundProjection::Height(ground.groundHeight,
+                            ground.groundNormal.x, ground.groundNormal.y,
+                            ground.groundNormal.z, delta.x, delta.y, &height) &&
+                        std::abs(height - car.base.z) < 2.0f)
                     {
-                        position.z = height;
-                        forward = forward - up * DotProduct(forward, up); forward.Normalise();
-                        right = CrossProduct(forward, up); right.Normalise();
+                        const CVector projectedForward = forward -
+                            ground.groundNormal * DotProduct(forward, ground.groundNormal);
+                        // Very steep or malformed normals can produce a zero
+                        // forward vector. Keep the original road-based basis.
+                        if (projectedForward.MagnitudeSqr() > 0.01f)
+                        {
+                            up = ground.groundNormal;
+                            position.z = height;
+                            forward = projectedForward;
+                            forward.Normalise();
+                            right = CrossProduct(forward, up);
+                            right.Normalise();
+                        }
                     }
-                    else up = CrossProduct(right, forward);
                 }
                 if (!car.boat) position.z += fDistantCarsGroundOffset;
                 const float scale = car.boat ? 1.0f : CarScale;
+#ifdef PROJECT2DFX_SA
+                const auto shape = SAFeaturePolicy::Shape(car.id,
+                    bSaDistantVehicleVariety && !car.boat);
+#endif
+#ifdef PROJECT2DFX_SA
+                auto world = [&](const CVector& p) { return position +
+                    (right * (p.x*shape.width) + forward * (p.y*shape.length) +
+                     up * (p.z*shape.height)) * scale; };
+#else
                 auto world = [&](const CVector& p) { return position + (right * p.x + forward * p.y + up * p.z) * scale; };
+#endif
                 auto normal = [&](const CVector& n) { return right * n.x + forward * n.y + up * n.z; };
 #ifdef PROJECT2DFX_SA
                 if (gpuCars)
@@ -395,33 +637,32 @@ export namespace DistantCarRenderer
                     const uint16_t baseVertex = static_cast<uint16_t>(gpuVertices.size());
                     const float matrixIdx = static_cast<float>(gpuWorlds.size());
                     GpuD3D9::CarWorld xform{{
-                        right.x*scale,right.y*scale,right.z*scale,0,
-                        forward.x*scale,forward.y*scale,forward.z*scale,0,
-                        up.x*scale,up.y*scale,up.z*scale,0,
+                        right.x*scale*shape.width,right.y*scale*shape.width,right.z*scale*shape.width,0,
+                        forward.x*scale*shape.length,forward.y*scale*shape.length,forward.z*scale*shape.length,0,
+                        up.x*scale*shape.height,up.y*scale*shape.height,up.z*scale*shape.height,0,
                         position.x,position.y,position.z,1
                     }};
                     gpuWorlds.push_back(xform);
                     auto* out = gpuVertices.append(mesh.vertices.size());
                     auto* ind = gpuIndices.append(mesh.indices.size());
                     if (!out || !ind) { HideLights(car.id); continue; }
+                    // Cache per-material colours once per car rather than
+                    // branching and recomputing RGB inside every vertex.
+                    const uint32_t materialRGB[] = {
+                        (uint32_t(paint[0]) << 16) |
+                        (uint32_t(paint[1]) << 8) | uint32_t(paint[2]),
+                        0x2C3E49u, 0x171819u, 0x878B8Cu,
+                        0xF5EFCEu, 0xAF100Au
+                    };
                     for (const auto& v : mesh.vertices)
                     {
-                        uint32_t r = paint[0], g = paint[1], b = paint[2];
-                        switch (v.material)
-                        {
-                        case DistantCarMesh::BoatHull:
-                            r=(v.color>>16)&255; g=(v.color>>8)&255; b=v.color&255; break;
-                        case DistantCarMesh::Glass: r=44;g=62;b=73;break;
-                        case DistantCarMesh::Rubber:r=23;g=24;b=25;break;
-                        case DistantCarMesh::Chrome:r=135;g=139;b=140;break;
-                        case DistantCarMesh::Headlight:r=245;g=239;b=206;break;
-                        case DistantCarMesh::Taillight:r=175;g=16;b=10;break;
-                        default:break;
-                        }
-                        *out++={v.position.x,v.position.y,v.position.z,
-                                v.normal.x,v.normal.y,v.normal.z,
-                                alpha | (r<<16) | (g<<8) | b,
-                                static_cast<float>(v.material),matrixIdx};
+                        const unsigned material = static_cast<unsigned>(v.material);
+                        const uint32_t rgbValue = material <
+                            std::size(materialRGB) ? materialRGB[material] :
+                            (v.color & 0xFFFFFFu);
+                        *out++ = {v.position.x,v.position.y,v.position.z,
+                                  v.normal.x,v.normal.y,v.normal.z,
+                                  alpha | rgbValue,static_cast<float>(v.material),matrixIdx};
                     }
                     for (short i : mesh.indices) *ind++=baseVertex+static_cast<uint16_t>(i);
                 }
@@ -471,12 +712,12 @@ export namespace DistantCarRenderer
                 }
 
 
-                // Lamps are always on (dimmed by day) and are readable from the
-                // side too: a 3D car whose lights only show when it drives
-                // straight at the camera reads as dead.
+                // 3D headlights and navigation coronas are night/twilight
+                // effects on GTA SA (unless explicitly set to legacy mode).
+                // Model geometry remains visible during the daytime.
                 if (car.boat)
                 {
-                    if (bDistantCars3DLights)
+                    if (bDistantCars3DLights && spriteNightFactor > .001f)
                     {
                         CVector view = camera - position; view.Normalise();
                         float fwd = DotProduct(forward, view), side = DotProduct(right, view);
@@ -485,7 +726,7 @@ export namespace DistantCarRenderer
                         {
                             bool port = lamp == 0, starboard = lamp == 1;
                             float strength = lamp == 2 ? 1.0f : sector * Saturate(.5f + (port ? -side : side) * 4.0f);
-                            auto alpha = static_cast<uint8_t>(220 * lightFade * strength * (.4f + .6f * lamps));
+                            auto alpha = static_cast<uint8_t>(220 * lightFade * strength * (.4f + .6f * lamps) * spriteNightFactor);
                             if (alpha < 4) continue;
                             CVector p = world({ port ? -1.6f : starboard ? 1.6f : 0.0f, lamp == 2 ? -3.0f : 2.0f, 1.4f });
                             CLODLights::RegisterCorona(0x7C000000u + (car.id - 0x7F000000u) * 4 + lamp, nullptr,
@@ -496,14 +737,14 @@ export namespace DistantCarRenderer
                     }
                     continue;
                 }
-                if (bDistantCars3DLights)
+                if (bDistantCars3DLights && spriteNightFactor > .001f)
                 {
                     CVector view = camera - position; view.Normalise();
                     float facing = DotProduct(view, forward);
                     // Front/rear sectors and a vertical cutoff stop the glow from
                     // shining through the car's own body from above or behind.
                     float vertical = Saturate((.95f - std::abs(DotProduct(view, up))) / .45f);
-                    const float glow = .55f + .45f * lamps;
+                    const float glow = (.55f + .45f * lamps) * spriteNightFactor;
                     for (uint32_t lamp = 0; lamp < 4; ++lamp)
                     {
                         bool front = lamp < 2;
@@ -525,6 +766,9 @@ export namespace DistantCarRenderer
                 }
             }
             flush();
+#ifdef PROJECT2DFX_SA
+            RenderProjectedRoadLights(now, hour, lamps);
+#endif
         }
 
     public:
@@ -545,7 +789,9 @@ export namespace DistantCarRenderer
         }
         bool Add(const CVector& coronaPosition, const CVector& direction, State& state, uint32_t id, float fade, bool boat = false)
         {
-            HideLights(id);
+            // Frame() has already retired every previous-frame 3D lamp.
+            // Repeating four ID removals for each Add() doubles lookup
+            // overhead at high traffic density without improving cleanup.
             if (!enabled || (boat && !bDistantBoats3D)) return false;
             CLODLights::UnregisterCorona(id);
             if (boat)
@@ -570,7 +816,16 @@ export namespace DistantCarRenderer
             if (screen.x < -marginX || screen.y < -marginY ||
                 screen.x > RsGlobal->width + marginX || screen.y > RsGlobal->height + marginY) return true;
             previousLights.push_back(id);
-            cars.push_back({ base,direction,&state,id,fade,(base - camera).MagnitudeSqr(),boat });
+            bool lowDetail = false;
+#ifdef PROJECT2DFX_SA
+            if (!boat && bSaDistanceQuality) {
+                const float distance = (base - camera).Magnitude();
+                lowDetail = SAFeaturePolicy::DetailTier(distance,
+                    fSaTrafficMediumDistance, fSaTrafficFarDistance, true)
+                    != SAFeaturePolicy::Tier::Full;
+            }
+#endif
+            cars.push_back({ base,direction,&state,id,fade,(base - camera).MagnitudeSqr(),boat,lowDetail });
             return true;
         }
     };

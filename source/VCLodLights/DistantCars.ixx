@@ -460,7 +460,8 @@ void CMovingThings::RenderDistantCarImpostors()
         if (impostor.m_bWaterNode && !bDistantMaritimeTraffic)
             continue;
 
-        CVector toImpostor = traffic.RenderPosition(impostor) - camPos;
+        const CVector renderPos = traffic.RenderPosition(impostor);
+        const CVector toImpostor = renderPos - camPos;
         float distSqr = toImpostor.MagnitudeSqr2D();
         if (distSqr < SQR(140.0f) || distSqr > SQR(maxDist))
             continue;
@@ -469,7 +470,9 @@ void CMovingThings::RenderDistantCarImpostors()
         if (dist < 0.001f)
             continue;
 
-        float dirDot = DotProduct(traffic.RenderDirection(impostor), camPos - traffic.RenderPosition(impostor));
+        const CVector renderDir = traffic.RenderDirection(impostor);
+
+        float dirDot = DotProduct(renderDir, camPos - renderPos);
         bool approaching = dirDot > 0.0f;
 
         uint8 red, green, blue;
@@ -492,7 +495,7 @@ void CMovingThings::RenderDistantCarImpostors()
         float fadeNear = Clamp((dist * nearScale - 140.0f) / 120.0f, 0.0f, 1.0f);
         float fade = fadeFar * fadeNear;
 
-        if (models.Add(traffic.RenderPosition(impostor), traffic.RenderDirection(impostor), impostor.m_visual, impostor.m_nCoronaId, fade, impostor.m_bWaterNode))
+        if (models.Add(renderPos, renderDir, impostor.m_visual, impostor.m_nCoronaId, fade, impostor.m_bWaterNode))
             continue;
 
         float size = 4.0f * fDistantCarsRadiusMultiplier;
@@ -506,13 +509,13 @@ void CMovingThings::RenderDistantCarImpostors()
         CVector portPos, stbdPos;
         if (impostor.m_bWaterNode)
         {
-            float toCamX = camPos.x - traffic.RenderPosition(impostor).x;
-            float toCamY = camPos.y - traffic.RenderPosition(impostor).y;
+            float toCamX = camPos.x - renderPos.x;
+            float toCamY = camPos.y - renderPos.y;
             float toCamLen = Sqrt(toCamX * toCamX + toCamY * toCamY);
             if (toCamLen > 0.001f)
             {
-                float fwd = (traffic.RenderDirection(impostor).x * toCamX + traffic.RenderDirection(impostor).y * toCamY) / toCamLen;
-                boatCross = traffic.RenderDirection(impostor).x * toCamY - traffic.RenderDirection(impostor).y * toCamX;
+                float fwd = (renderDir.x * toCamX + renderDir.y * toCamY) / toCamLen;
+                boatCross = renderDir.x * toCamY - renderDir.y * toCamX;
 
                 // Sidelights cover from dead ahead to 22.5° abaft the beam.
                 constexpr float SECTOR_EDGE = -0.38f; // cos(112.5°)
@@ -529,10 +532,10 @@ void CMovingThings::RenderDistantCarImpostors()
                 // bow so red and green are clearly separated and never wash
                 // out against the white masthead light.
                 const float beamHalf = 2.0f;
-                portPos = traffic.RenderPosition(impostor) +
-                          CVector(-traffic.RenderDirection(impostor).y * beamHalf, traffic.RenderDirection(impostor).x * beamHalf, 0.0f);
-                stbdPos = traffic.RenderPosition(impostor) +
-                          CVector(traffic.RenderDirection(impostor).y * beamHalf, -traffic.RenderDirection(impostor).x * beamHalf, 0.0f);
+                portPos = renderPos +
+                          CVector(-renderDir.y * beamHalf, renderDir.x * beamHalf, 0.0f);
+                stbdPos = renderPos +
+                          CVector(renderDir.y * beamHalf, -renderDir.x * beamHalf, 0.0f);
             }
         }
         if (alpha == 0 && sideAlpha == 0)
@@ -540,7 +543,7 @@ void CMovingThings::RenderDistantCarImpostors()
 
         if (alpha)
         {
-            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, traffic.RenderPosition(impostor), size, maxDist, 1, 0, false,
+            CLODLights::RegisterCorona(impostor.m_nCoronaId, nullptr, red, green, blue, alpha, renderPos, size, maxDist, 1, 0, false,
                                        false, 0, 0.0f, false, 0.0f, 0, 255.0f, false, false);
         }
 

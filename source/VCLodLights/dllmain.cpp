@@ -156,10 +156,11 @@ bool IsModelASwapSource(unsigned short nModelID)
 
 void InsertLamppostsForModel(CEntity* pObj, unsigned short nModelID)
 {
-    auto foundElements = FileContent | std::views::filter([minKey = PackKey(nModelID, 0), maxKey = PackKey(nModelID, 0xFFFF)](const auto& kv)
-    {
-        return kv.first >= minKey && kv.first <= maxKey;
-    });
+    // FileContent is keyed by (model ID, effect index). Restrict the search
+    // to that model instead of scanning every distant-light record per entity.
+    const auto first = FileContent.lower_bound(PackKey(nModelID, 0));
+    const auto last = FileContent.upper_bound(PackKey(nModelID, 0xFFFF));
+    if (first == last) return;
 
     auto ms_modelInfoPtrs = *CModelInfo::pp_modelInfoPtrs;
     auto modelInfo = (CSimpleModelInfo*)ms_modelInfoPtrs[nModelID];
@@ -173,8 +174,9 @@ void InsertLamppostsForModel(CEntity* pObj, unsigned short nModelID)
     }
 
     float heading = atan2(-pObj->GetMatrix().GetRight().y, pObj->GetMatrix().GetRight().x);
-    for (const auto& [key, data] : foundElements)
+    for (auto it = first; it != last; ++it)
     {
+        const auto& data = it->second;
         CVector worldPos = pObj->GetMatrix() * data.vecLocalPos;
         m_Lampposts.push_back(CLamppostInfo(
             worldPos,
@@ -185,7 +187,7 @@ void InsertLamppostsForModel(CEntity* pObj, unsigned short nModelID)
             data.nNoDistance,
             data.nDrawSearchlight ? static_cast<int>(objectHeight) : 0,
             heading,
-            std::min(data.fObjectDrawDistance, modelInfo->m_lodDistances[2]),
+            (modelInfo ? (std::min)(data.fObjectDrawDistance, modelInfo->m_lodDistances[2]) : data.fObjectDrawDistance),
             data.pPredicate
         ));
         if (data.fCustomSizeMult == .45f)

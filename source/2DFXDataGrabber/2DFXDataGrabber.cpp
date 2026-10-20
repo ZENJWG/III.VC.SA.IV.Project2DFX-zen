@@ -162,15 +162,17 @@ void ConvertDFFTo2DFX()
                     if (LodLights.is_open())
                     {
                         ifstream TXTFileContent(fd.cFileName); string buf;
-                        string ext = fd.cFileName; ext.replace(ext.find(".txt"), 4, "\0");
+                        string ext = fd.cFileName;
+                        if (ext.size() < 4) continue;
+                        ext.resize(ext.size() - 4);
                         LodLights << "%" << ext.c_str() << endl;
 
-                        string EntryName; float offsetX, offsetY, offsetZ, CoronaSize, DrawDistance; int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0;
+                        float offsetX = 0, offsetY = 0, offsetZ = 0, CoronaSize = 0, DrawDistance = 0; int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0;
                         while (getline(TXTFileContent, buf))
                         {
                             if (buf[0] != '#')
                             {
-                                if (sscanf(buf.c_str(), "%s", &EntryName[0]))
+                                if (buf.find_first_not_of(" \t\r\n") != std::string::npos)
                                 {
                                     if (buf.find("Position") != std::string::npos)
                                     {
@@ -488,7 +490,9 @@ void ConvertLightTo2DFX()
             {
 
                 ifstream TXTFileContent(fd.cFileName); string buf;
-                string ext = fd.cFileName; ext.replace(ext.find(".light"), 6, "\0");
+                string ext = fd.cFileName;
+                if (ext.size() < 6) continue;
+                ext.resize(ext.size() - 6);
                 string ext2 = ext;
                 //LodLights << "%" << ext.c_str() << endl;
                 bool mdlname = false;
@@ -497,12 +501,12 @@ void ConvertLightTo2DFX()
                 //	ext2.find("cj_nylamp2b") != std::string::npos)
                 //	continue;
 
-                string EntryName; float offsetX, offsetY, offsetZ, CoronaSize, DrawDistance;	int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0; int BoneID = 0; int type_matched = 0;
+                float offsetX = 0, offsetY = 0, offsetZ = 0, CoronaSize = 0, DrawDistance = 0;	int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0; int BoneID = 0; int type_matched = 0;
                 while (getline(TXTFileContent, buf))
                 {
                     if (buf[0] != '#')
                     {
-                        if (sscanf(buf.c_str(), "%s", &EntryName[0]))
+                        if (buf.find_first_not_of(" \t\r\n") != std::string::npos)
                         {
                             if (buf.find("Flags") != std::string::npos && buf.find("TypeFlags") == std::string::npos)
                             {
@@ -781,9 +785,9 @@ int _tmain(int argc, _TCHAR* argv[])
 
     while (getline(GTAData, line))
     {
-        if (line[0] != '#')
+        if (!line.empty() && line[0] != '#')
         {
-            if (line[0] == 'I' && line[1] == 'D' && line[2] == 'E')
+            if (line.size() >= 3 && line[0] == 'I' && line[1] == 'D' && line[2] == 'E')
             {
                 cout << line.c_str() + 9 << endl;
                 string IDEline;
@@ -792,11 +796,11 @@ int _tmain(int argc, _TCHAR* argv[])
                 {
                     while (getline(IDEFile, IDEline))
                     {
-                        if (IDEline[0] != '#')
+                        if (!IDEline.empty() && IDEline[0] != '#')
                         {
-                            int ID; string ModelName;
-                            IDEline.erase(std::remove(IDEline.begin(), IDEline.end(), ','), IDEline.end());
-                            if (sscanf(IDEline.c_str(), "%d %s %*s %*d %*s", &ID, &ModelName[0]))
+                            int ID = -1;
+                            std::replace(IDEline.begin(), IDEline.end(), ',', ' ');
+                            if (sscanf(IDEline.c_str(), "%d", &ID) == 1)
                             {
                                 if (IDEline.find("coronastar") == std::string::npos)
                                 {
@@ -811,7 +815,7 @@ int _tmain(int argc, _TCHAR* argv[])
                     }
                 }
             }
-            else if (line[0] == 'I' && line[1] == 'P' && line[2] == 'L')
+            else if (line.size() >= 3 && line[0] == 'I' && line[1] == 'P' && line[2] == 'L')
             {
                 cout << line.c_str() + 9 << endl;
                 string IPLline;
@@ -820,11 +824,11 @@ int _tmain(int argc, _TCHAR* argv[])
                 {
                     while (getline(IDEFile, IPLline))
                     {
-                        if (IPLline[0] != '#')
+                        if (!IPLline.empty() && IPLline[0] != '#')
                         {
-                            int ID; string ModelName;
-                            IPLline.erase(std::remove(IPLline.begin(), IPLline.end(), ','), IPLline.end());
-                            if (sscanf(IPLline.c_str(), "%d %s %*s %*d %*s", &ID, &ModelName[0]))
+                            int ID = -1;
+                            std::replace(IPLline.begin(), IPLline.end(), ',', ' ');
+                            if (sscanf(IPLline.c_str(), "%d", &ID) == 1)
                             {
                                 if (IPLline.find("coronastar") == std::string::npos)
                                 {
@@ -859,10 +863,13 @@ int _tmain(int argc, _TCHAR* argv[])
         static int TrafficLCount;
         while (getline(FX2DData, line))
         {
-            int ID; float offsetX, offsetY, offsetZ; int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0; int unk1, type; string Corona, Shadow; float Distance, OuterRange, CoronaSize, InnerRange; int ShadowIntensity, Wet, Flare, Dust;
-            line.erase(std::remove(line.begin(), line.end(), ','), line.end());
-            if (sscanf(line.c_str(), "%d %f %f %f %d %d %d %d %d %s %s %f %f %f %f %d %d %d %d %d",
-                &ID, &offsetX, &offsetY, &offsetZ, &R, &G, &B, &unk1, &type, &Corona[0], &Shadow[0], &Distance, &OuterRange, &CoronaSize, &InnerRange, &ShadowIntensity, &BlinkType, &Wet, &Flare, &Dust))
+            int ID; float offsetX, offsetY, offsetZ; int R = 0, G = 0, B = 0, A = 255; int BlinkType = 0; int nNoDistance = 0; int nDrawSearchlight = 0; int unk1 = 0, type = 0;
+            char Corona[64] = {}, Shadow[64] = {};
+            float Distance = 0, OuterRange = 0, CoronaSize = 0, InnerRange = 0;
+            int ShadowIntensity = 0, Wet = 0, Flare = 0, Dust = 0;
+            std::replace(line.begin(), line.end(), ',', ' ');
+            if (sscanf(line.c_str(), "%d %f %f %f %d %d %d %d %d %63s %63s %f %f %f %f %d %d %d %d %d",
+                &ID, &offsetX, &offsetY, &offsetZ, &R, &G, &B, &unk1, &type, Corona, Shadow, &Distance, &OuterRange, &CoronaSize, &InnerRange, &ShadowIntensity, &BlinkType, &Wet, &Flare, &Dust) == 20)
             {
                 enum
                 {
@@ -977,13 +984,13 @@ int _tmain(int argc, _TCHAR* argv[])
                     IDEData.seekg(0, ios::beg);
                     while (getline(IDEData, line2))
                     {
-                        line2.erase(std::remove(line2.begin(), line2.end(), ','), line2.end());
-                        int IdeID; string ModelName2;
-                        if (sscanf(line2.c_str(), "%d %s %*s %*d %*s", &IdeID, &ModelName2[0]))
+                        std::replace(line2.begin(), line2.end(), ',', ' ');
+                        int IdeID = -1; char ModelName2[64] = {};
+                        if (sscanf(line2.c_str(), "%d %63s", &IdeID, ModelName2) == 2)
                         {
                             if (IdeID == ID)
                             {
-                                LodLights << "%" << ModelName2.c_str() << endl;
+                                LodLights << "%" << ModelName2 << endl;
                                 break;
                             }
                         }
@@ -1198,7 +1205,7 @@ int _tmain(int argc, _TCHAR* argv[])
             RwV3d2 trans2{}, scale2{}, axis2{};
             RwV3d trans{}, scale{}, axis{};
             double angle = 0.0;
-            line.erase(std::remove(line.begin(), line.end(), ','), line.end());
+            std::replace(line.begin(), line.end(), ',', ' ');
             int fields = sscanf(line.c_str(), "%d %99s %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
                 &ModelId, ModelName, &Interior,
                 &trans2.x, &trans2.y, &trans2.z,
@@ -1234,7 +1241,7 @@ int _tmain(int argc, _TCHAR* argv[])
                 string nModel;
                 while (getline(LodLights2, line))
                 {
-                    if (line[0] && line[0] != '#')
+                    if (!line.empty() && line[0] != '#')
                     {
                         auto x = 1;
                         if (line[0] == '%')
@@ -1252,7 +1259,8 @@ int _tmain(int argc, _TCHAR* argv[])
                             int				nNoDistance = 0;
                             int				nDrawSearchlight = 0;
                             int				nCoronaShowMode = 0;
-                            sscanf(line.c_str(), "%3d %3d %3d %3d %f %f %f %f %f %2d %1d %1d", &nRed, &nGreen, &nBlue, &nAlpha, &fOffsetX, &fOffsetY, &fOffsetZ, &fCustomSize, &fDistance, &nCoronaShowMode, &nNoDistance, &nDrawSearchlight);
+                            if (sscanf(line.c_str(), "%3d %3d %3d %3d %f %f %f %f %f %2d %1d %1d", &nRed, &nGreen, &nBlue, &nAlpha, &fOffsetX, &fOffsetY, &fOffsetZ, &fCustomSize, &fDistance, &nCoronaShowMode, &nNoDistance, &nDrawSearchlight) != 12)
+                                continue;
 
                             CMatrix dummyMatrix;
                             // Roundoff may place a quaternion scalar just outside [-1, 1].

@@ -1,8 +1,13 @@
 #define NOMINMAX
 #include "stdafx.h"
 #include "DrawDistancePolicy.hpp"
+#include "AdaptiveFarClip.hpp"
+#include "SAVersionGuard.hpp"
+#include "StreamingBudget.hpp"
+#include "SAModelOverrides.hpp"
 #include "ModelPreloadPolicy.hpp"
 #include "SAObjectClassification.hpp"
+#include "SAFeaturePolicy.hpp"
 #include <cstdio>
 #include <array>
 #include <bitset>
@@ -26,6 +31,7 @@ import DistantCarRenderer;
 import WaterLevel;
 
 using RwV3D = RwV3d;
+static SAModelOverrides::Table g_modelDistanceOverrides{};
 
 void RegisterCustomCoronas()
 {
@@ -90,14 +96,24 @@ void RegisterLamppost(CEntity* pObj)
 
 // GTA SA model preloader: capture *IDE model IDs* during level loading and
 // request a bounded, deduplicated set once the game reaches GAMESTATE_LOADED.
-// Unlike PreloadLODs, this does NOT manufacture an RwObject for each entity.
+// The unified preload path never manufactures an RwObject for each entity.
 // Pinning every map model can exhaust the game's streaming memory: opt in,
 // keep a strict model-count cap, and never run on the renderer hot path.
 namespace ModelPreloader
 {
+    struct PositionHint {
+        float x = 0, y = 0, z = 0;
+        bool valid = false;
+    };
     static std::array<std::uint8_t, ModelPreloadPolicy::kModelCount> categories{};
+    static std::array<PositionHint, ModelPreloadPolicy::kModelCount> positions{};
     static std::bitset<ModelPreloadPolicy::kModelCount> requested{};
-    static bool completed = false;
+    static unsigned requestedCount = 0;
+    static std::vector<int> candidates{};
+    static size_t cursor = 0;
+    static size_t transitionCursor = 0;
+    static bool prepared = false;
+    static uint32_t initialMemory = 0;
 
     std::uint8_t Enabled()
     {
@@ -105,14 +121,21 @@ namespace ModelPreloader
             bPreloadNormalModels, bPreloadTimedModels,
             bPreloadVegetationModels, bPreloadGenericModels,
             bPreloadNeonModels, bPreloadBigBuildingModels,
-            bPreloadAnimatedModels, bPreloadAllLODModels);
+            bPreloadAnimatedModels,
+            bPreloadAllLODModels || (bPreloadLODs && !bSaLODTransitionAssist));
     }
 
     void Reset()
     {
         categories.fill(0);
+        positions.fill({});
         requested.reset();
-        completed = false;
+        requestedCount = 0;
+        candidates.clear();
+        cursor = 0;
+        transitionCursor = 0;
+        prepared = false;
+        initialMemory = 0;
     }
 
     void Record(int modelId, std::uint8_t category)
@@ -121,8 +144,23 @@ namespace ModelPreloader
             categories[static_cast<size_t>(modelId)] |= category;
     }
 
-    // The normal/generic/vegetation membership is based on the *original*
-    // IDE distance, not an already extended value.
+    void RecordHint(int modelId, const CVector& pos)
+    {
+        if (!ModelPreloadPolicy::ValidId(modelId) ||
+            !std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z))
+            return;
+        auto& hint = positions[static_cast<size_t>(modelId)];
+        if (!hint.valid) {
+            hint = { pos.x, pos.y, pos.z, true };
+        }
+        // Repeated instances may share a model. Keep the instance nearest
+        // the map center as a deterministic approximation; GTA remains
+        // responsible for actual visibility/streaming decisions.
+        else if (pos.x * pos.x + pos.y * pos.y <
+                 hint.x * hint.x + hint.y * hint.y)
+            hint = { pos.x, pos.y, pos.z, true };
+    }
+
     void RecordObject(int modelId, float rawDistance, bool interior,
                       SAObjectClassification::Kind kind)
     {
@@ -130,51 +168,133 @@ namespace ModelPreloader
             interior, kind.generic, kind.vegetation));
     }
 
-    void Flush()
+    // Ranked by category and then proximity to player's initial position.
+    // Sort once, never in the rendering hot path.
+    static int Priority(std::uint8_t mask)
     {
-        if (completed || !Enabled() || gGameState != 9)
-            return;
-        auto** modelTable = CModelInfo::pp_modelInfoPtrs ?
-            *CModelInfo::pp_modelInfoPtrs : nullptr;
-        if (!modelTable || !CStreaming::RequestModel || !CStreaming::LoadAllRequestedModels)
-            return;
-        completed = true; // Once per level; never block the regular render loop.
-
-        const auto enabled = Enabled();
-        const unsigned limit = ModelPreloadPolicy::ClampLimit(
-            iPreloadMaxModels, 128u, 1024u);
-        const unsigned batchSize = ModelPreloadPolicy::ClampLimit(
-            iPreloadBatchSize, 16u, 64u);
-        unsigned count = 0, queued = 0;
-
-        // Prefer rare, targeted categories over "all normal" when capped.
         constexpr std::uint8_t order[] = {
             ModelPreloadPolicy::BigBuilding, ModelPreloadPolicy::Neon,
             ModelPreloadPolicy::Timed, ModelPreloadPolicy::Animated,
             ModelPreloadPolicy::Vegetation, ModelPreloadPolicy::Generic,
             ModelPreloadPolicy::Lod, ModelPreloadPolicy::Normal
         };
-        constexpr int flags = 0x2 | 0x8; // GAME_REQUIRED | KEEP_IN_MEMORY
-        for (const auto category : order)
+        for (int i = 0; i < static_cast<int>(std::size(order)); ++i)
+            if (mask & order[i]) return i;
+        return static_cast<int>(std::size(order));
+    }
+
+    void Prepare()
+    {
+        if (prepared) return;
+        const auto enabled = Enabled();
+        if (!enabled) return;
+        auto** table = CModelInfo::pp_modelInfoPtrs ?
+            *CModelInfo::pp_modelInfoPtrs : nullptr;
+        // ModelInfo may not be initialized during an early process tick.
+        // Retry rather than permanently committing to an empty candidate list.
+        if (!table) return;
+        initialMemory = *reinterpret_cast<const uint32_t*>(0x8E4CB4);
+        prepared = true;
+        candidates.clear();
+
+        for (int id = 0; id < ModelPreloadPolicy::kModelCount; ++id)
+            if ((categories[static_cast<size_t>(id)] & enabled) && table[id])
+                candidates.push_back(id);
+        const CVector* cam = GetCamPos();
+        const float cameraX = cam && std::isfinite(cam->x) ? cam->x : 0.0f;
+        const float cameraY = cam && std::isfinite(cam->y) ? cam->y : 0.0f;
+        const auto distance = [&](int id) {
+            const auto& p = positions[static_cast<size_t>(id)];
+            if (!p.valid) return 1.0e20f;
+            const float dx = p.x - cameraX, dy = p.y - cameraY;
+            return dx * dx + dy * dy;
+        };
+        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+            const int pa = Priority(categories[static_cast<size_t>(a)] & enabled);
+            const int pb = Priority(categories[static_cast<size_t>(b)] & enabled);
+            if (pa != pb) return pa < pb;
+            const float da = distance(a), db = distance(b);
+            return da != db ? da < db : a < b;
+        });
+    }
+
+    // Opportunistic, budgeted streaming lead-in for linked LOD models. The
+    // renderer itself retains vanilla LOD visibility/alpha decisions: never
+    // force a second entity to render, which would cause Z-fighting.
+    static void TickTransition(unsigned maxModels, unsigned& outstanding)
+    {
+        if (!bSaLODTransitionAssist || !CModelInfo::pp_modelInfoPtrs ||
+            !CStreaming::RequestModel || requestedCount >= maxModels)
+            return;
+        auto** models = *CModelInfo::pp_modelInfoPtrs;
+        const CVector* camera = GetCamPos();
+        if (!models || !camera || !std::isfinite(camera->x) ||
+            !std::isfinite(camera->y) || !std::isfinite(camera->z)) return;
+        const float band = SAFeaturePolicy::ClampFinite(
+            fSaLODTransitionDistance, 10.0f, 500.0f, 80.0f);
+        constexpr size_t kScanPerTick = 256;
+        unsigned submitted = 0;
+        for (size_t n = 0; n < kScanPerTick && submitted < 2 &&
+             outstanding < 16 && requestedCount < maxModels; ++n)
         {
-            if (!(enabled & category)) continue;
-            for (int id = 0; id < ModelPreloadPolicy::kModelCount && count < limit; ++id)
-            {
-                const auto index = static_cast<size_t>(id);
-                if (!(categories[index] & category) || requested.test(index) || !modelTable[id])
-                    continue;
-                requested.set(index);
-                CStreaming::RequestModel(id, flags);
-                ++count;
-                if (++queued >= batchSize)
-                {
-                    CStreaming::LoadAllRequestedModels(false);
-                    queued = 0;
-                }
-            }
+            const size_t id = transitionCursor++ % ModelPreloadPolicy::kModelCount;
+            if (!(categories[id] & ModelPreloadPolicy::Lod) ||
+                !positions[id].valid || !models[id] || requested.test(id))
+                continue;
+            const auto& p = positions[id];
+            const float dx=p.x-camera->x, dy=p.y-camera->y, dz=p.z-camera->z;
+            const float distance = std::sqrt(dx*dx+dy*dy+dz*dz);
+            const float drawDistance = models[id]->m_fDrawDistance;
+            if (!SAFeaturePolicy::ShouldPrefetchLOD(distance, drawDistance, band))
+                continue;
+            requested.set(id);
+            ++requestedCount;
+            CStreaming::RequestModel(static_cast<int>(id),0);
+            ++submitted;
+            ++outstanding;
         }
-        if (queued)
-            CStreaming::LoadAllRequestedModels(false);
+    }
+
+    // Let GTA's asynchronous streamer load and evict models naturally.
+    // In contrast to the previous KEEP_IN_MEMORY requests, models are NOT
+    // permanently pinned and RwObjects are not manufactured at IPL load.
+    void Tick()
+    {
+        if ((!Enabled() && !bSaLODTransitionAssist) || gGameState != 9 || !CStreaming::RequestModel)
+            return;
+        Prepare();
+        const unsigned maxModels = ModelPreloadPolicy::ClampLimit(
+            iPreloadMaxModels, 128u, 1024u);
+        const unsigned batch = ModelPreloadPolicy::ClampLimit(
+            iPreloadBatchSize, 8u, 64u);
+        const auto memoryUsed = *reinterpret_cast<const uint32_t*>(0x8E4CB4);
+        const auto memoryAvailable = *reinterpret_cast<const uint32_t*>(0x8A5A80);
+        unsigned outstanding = *reinterpret_cast<const uint32_t*>(0x8E4CB8);
+        // Respect GTA streaming pressure and a shared RAM budget.
+        if (!StreamingBudget::CanRequest(memoryUsed, memoryAvailable,
+                initialMemory, outstanding, iPreloadMemoryBudgetMB,
+                iPreloadMinFreeMB)) return;
+        TickTransition(maxModels, outstanding);
+        if (!Enabled() || cursor >= candidates.size() || outstanding >= 16 ||
+            requestedCount >= maxModels)
+            return;
+        const unsigned quantity = (std::min)({batch, 16u - outstanding,
+                                               maxModels - requestedCount});
+        // A transition prefetch may already have requested early sorted IDs.
+        // Scan beyond those IDs instead of stopping at the first maxModels
+        // candidates. Limit per-tick scanning to avoid frame-time spikes.
+        const size_t scanEnd = (std::min)(candidates.size(),
+            cursor + static_cast<size_t>(quantity) * 8u);
+        unsigned submitted = 0;
+        while (cursor < scanEnd && submitted < quantity) {
+            const int id = candidates[cursor++];
+            if (requested.test(static_cast<size_t>(id))) continue;
+            requested.set(static_cast<size_t>(id));
+            ++requestedCount;
+            ++submitted;
+            CStreaming::RequestModel(id, 0); // no KEEP_IN_MEMORY / GAME_REQUIRED
+        }
+        // DO NOT call LoadAllRequestedModels here: it blocks the game thread.
     }
 }
 
@@ -222,9 +342,10 @@ namespace BigBuildingDrawDistance
             rawObjectDistances[static_cast<size_t>(id)] : info->m_fDrawDistance;
         // A real LOD (bIsBIGBuilding) may have original IDE distance <=300,
         // unlike the legacy >300 heuristic. Respect both model and entity.
-        info->m_fDrawDistance = DrawDistancePolicy::BigBuildingCombined(
-            original, info->m_fDrawDistance, fLODObjectsDrawDistance,
-            fBigBuildingsDrawDistance);
+        info->m_fDrawDistance = g_modelDistanceOverrides.Apply(id,
+            DrawDistancePolicy::BigBuildingCombined(
+                original, info->m_fDrawDistance, fLODObjectsDrawDistance,
+                fBigBuildingsDrawDistance));
     }
 }
 
@@ -280,10 +401,14 @@ namespace CFileLoader
             kind.generic, kind.vegetation, fLODObjectsDrawDistance,
             fGenericObjectsDrawDistance, fAllNormalObjectsDrawDistance,
             fVegetationDrawDistance);
-        info->m_fDrawDistance = distance;
-        if (original <= 300.0f && !interior)
+        info->m_fDrawDistance = g_modelDistanceOverrides.Apply(id, distance);
+        // Explicit CSV overrides may intentionally extend an interior model.
+        // Include those distances in the normal-object world scan as well,
+        // otherwise the model can disappear before its new IDE radius is reached.
+        if (DrawDistancePolicy::NeedsNormalScanExtension(
+                original, info->m_fDrawDistance, interior))
             fMaxDrawDistanceForNormalObjects =
-                (std::max)(fMaxDrawDistanceForNormalObjects, distance);
+                (std::max)(fMaxDrawDistanceForNormalObjects, info->m_fDrawDistance);
         return id;
     }
 
@@ -306,6 +431,7 @@ namespace CFileLoader
             original, name, fTimedObjectsDrawDistance, fNeonsDrawDistance);
         if (std::isfinite(changed) && changed > original)
             info->m_fDrawDistance = changed;
+        info->m_fDrawDistance = g_modelDistanceOverrides.Apply(id, info->m_fDrawDistance);
         return id;
     }
 
@@ -330,14 +456,18 @@ namespace CFileLoader
         const float original = info->m_fDrawDistance;
         BigBuildingDrawDistance::Remember(id, original);
         ModelPreloader::Record(id, ModelPreloadPolicy::Animated);
-        info->m_fDrawDistance =
-            DrawDistancePolicy::Animated(original, fAnimatedObjectsDrawDistance);
+        info->m_fDrawDistance = g_modelDistanceOverrides.Apply(id,
+            DrawDistancePolicy::Animated(original, fAnimatedObjectsDrawDistance));
         return result;
     }
 
     CEntity* __cdecl LoadObjectInstance(void* inst)
     {
-        return PossiblyAddThisEntity(shLoadObjectInstance.unsafe_ccall<CEntity*>(inst));
+        auto* entity = PossiblyAddThisEntity(shLoadObjectInstance.unsafe_ccall<CEntity*>(inst));
+        if (entity && ModelPreloader::Enabled())
+            ModelPreloader::RecordHint(entity->GetModelIndex(),
+                entity->GetTransform().m_translate);
+        return entity;
     }
 }
 
@@ -369,37 +499,22 @@ void DrawDistanceChanger()
             QueryPerformanceFrequency(&value);
             return value;
         }();
-        // Fixed-size ring avoids deque growth/shrink and allocator traffic in
-        // this per-frame hook.
-        static std::array<int64_t, 60> frameTimes{};
-        static size_t sampleCount = 0;
-        static size_t nextSample = 0;
-        static float adaptiveBase = fFarClipMinMultiplier;
-
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        frameTimes[nextSample] = now.QuadPart;
-        nextSample = (nextSample + 1) % frameTimes.size();
-        sampleCount = (std::min)(sampleCount + 1, frameTimes.size());
-
-        if (sampleCount >= 2 && freq.QuadPart > 0)
-        {
-            const size_t oldest = (nextSample + frameTimes.size() - sampleCount) % frameTimes.size();
-            const auto elapsed = now.QuadPart - frameTimes[oldest];
-            if (elapsed > 0)
-            {
-                float smoothFPS = static_cast<float>(frameTimes.size() - 1) *
-                    static_cast<float>(freq.QuadPart) / static_cast<float>(elapsed);
-                const float step = (fFarClipMaxMultiplier - fFarClipMinMultiplier) * 0.002f;
-                adaptiveBase += smoothFPS < static_cast<float>(nFarClipTargetFPS) ? -step : step;
-                adaptiveBase = (std::clamp)(adaptiveBase, fFarClipMinMultiplier, fFarClipMaxMultiplier);
-            }
+        static AdaptiveFarClip::Controller<60> controller{};
+        static bool initialized = false;
+        if (!initialized) {
+            controller.Reset(fFarClipMinMultiplier);
+            initialized = true;
         }
+        LARGE_INTEGER now{};
+        if (QueryPerformanceCounter(&now) && freq.QuadPart > 0)
+            controller.Observe(now.QuadPart, freq.QuadPart,
+                static_cast<float>(nFarClipTargetFPS),
+                fFarClipMinMultiplier, fFarClipMaxMultiplier);
 
         const float cameraZ = GetCamPos()->z;
         const float heightBonus = std::isfinite(cameraZ) ?
             fFarClipHeightFactor * (std::max)(cameraZ, 0.0f) : 0.0f;
-        fEffectiveFarClipMultiplier = (std::clamp)(adaptiveBase + heightBonus,
+        fEffectiveFarClipMultiplier = (std::clamp)(controller.value + heightBonus,
             fFarClipMinMultiplier, fFarClipMaxMultiplier);
     }
     fSunSizeMult1 = 2.7335f * fEffectiveFarClipMultiplier;
@@ -542,7 +657,7 @@ void ApplyMemoryPatches()
 
     if ((std::isfinite(fBigBuildingsDrawDistance) && fBigBuildingsDrawDistance > 0.0f) ||
         (std::isfinite(fLODObjectsDrawDistance) && fLODObjectsDrawDistance > 0.0f) ||
-        bPreloadBigBuildingModels)
+        bPreloadBigBuildingModels || !sModelDrawDistanceOverridesFile.empty())
     {
         // GTA SA 1.0 US: CEntity::SetupBigBuilding at 0x533150.
         BigBuildingDrawDistance::setupHook =
@@ -557,7 +672,8 @@ void ApplyMemoryPatches()
     const bool normalPreloadEnabled = bPreloadNormalModels || bPreloadVegetationModels ||
         bPreloadGenericModels || bPreloadAllLODModels;
 
-    if (normalDistanceEnabled || normalPreloadEnabled || fBigBuildingsDrawDistance > 0.0f)
+    if (normalDistanceEnabled || normalPreloadEnabled || fBigBuildingsDrawDistance > 0.0f ||
+        !sModelDrawDistanceOverridesFile.empty())
     {
         // The former 0x5B3D9F inline hook caught one internal assignment;
         // detour the documented loader entry instead, covering multi-atomic
@@ -572,7 +688,8 @@ void ApplyMemoryPatches()
 
         if (fGenericObjectsDrawDistance > 0.0f ||
             fAllNormalObjectsDrawDistance > 0.0f ||
-            fVegetationDrawDistance > 0.0f)
+            fVegetationDrawDistance > 0.0f ||
+            !sModelDrawDistanceOverridesFile.empty())
         {
             // Raise the engine's shared "normal" distance threshold so a
             // longer per-model radius isn't clipped by vanilla world scanning.
@@ -592,60 +709,44 @@ void ApplyMemoryPatches()
             injector::WriteMemory(0x5B51E0 + 0x09A + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             injector::WriteMemory(0x554230 + 0x3B6 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             injector::WriteMemory(0x554230 + 0x3D0 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
-            injector::WriteMemory(0x554230 + 0x3FA + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            
         }
     }
 
     if (fTimedObjectsDrawDistance > 0.0f || fNeonsDrawDistance > 0.0f ||
-        fBigBuildingsDrawDistance > 0.0f || bPreloadTimedModels || bPreloadNeonModels)
+        fBigBuildingsDrawDistance > 0.0f || bPreloadTimedModels || bPreloadNeonModels ||
+        !sModelDrawDistanceOverridesFile.empty())
         CFileLoader::shLoadTimeObject =
             safetyhook::create_inline(0x5B3DE0, CFileLoader::LoadTimeObject);
 
     if (fAnimatedObjectsDrawDistance > 0.0f || bPreloadAnimatedModels ||
-        fBigBuildingsDrawDistance > 0.0f)
+        fBigBuildingsDrawDistance > 0.0f ||
+        !sModelDrawDistanceOverridesFile.empty())
         CFileLoader::shLoadAnimatedClumpObject =
             safetyhook::create_inline(0x5B40C0, CFileLoader::LoadAnimatedClumpObject);
 
-    if (bPreloadLODs || ModelPreloader::Enabled())
+    if (bPreloadLODs || bSaLODTransitionAssist || ModelPreloader::Enabled())
     {
-        static std::vector<CEntity*> lodPtrs;
-        if (bPreloadLODs)
+        // Collect model IDs while LOD IPL links are being resolved. Never hold
+        // pointers to game entities beyond the level-load phase.
+        if (bPreloadLODs || bSaLODTransitionAssist)
         {
             pattern = hook::pattern("8A 48 ? 80 F9 ? 8B 3C 95");
             static auto LinkLodsHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
             {
-                if (regs.eax)
-                    lodPtrs.push_back(reinterpret_cast<CEntity*>(regs.eax));
+                if (regs.eax) {
+                    auto* entity = reinterpret_cast<CEntity*>(regs.eax);
+                    ModelPreloader::Record(entity->GetModelIndex(), ModelPreloadPolicy::Lod);
+                    ModelPreloader::RecordHint(entity->GetModelIndex(),
+                        entity->GetTransform().m_translate);
+                }
             });
         }
 
-        // Existing post-level-load location. Both kinds of preloads happen
-        // once after IDE/IPL model definitions have been parsed, not on draw.
         pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? A0");
-        static auto CGameProcessHook2 = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
+        static auto CGameProcessHook2 = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext&)
         {
-            if (gGameState != 9) // GAMESTATE_LOADED
-                return;
-
-            // Keep legacy PreloadLODs entity/RW-object behavior untouched.
-            if (bPreloadLODs && !lodPtrs.empty())
-            {
-                auto uniquePtrs = lodPtrs;
-                std::sort(uniquePtrs.begin(), uniquePtrs.end(), [](CEntity* a, CEntity* b) {
-                    return a->GetModelIndex() < b->GetModelIndex();
-                });
-                uniquePtrs.erase(std::unique(uniquePtrs.begin(), uniquePtrs.end(),
-                    [](CEntity* a, CEntity* b) { return a->GetModelIndex() == b->GetModelIndex(); }),
-                    uniquePtrs.end());
-                for (auto* e : uniquePtrs)
-                    CStreaming::RequestModel(e->GetModelIndex(), 0x2 | 0x8);
-                CStreaming::LoadAllRequestedModels(false);
-                for (auto* e : lodPtrs)
-                    if (!e->m_pRwObject)
-                        CreateRwObject(e, nullptr);
-            }
-            lodPtrs.clear();
-            ModelPreloader::Flush();
+            ModelPreloader::Tick();
         });
     }
 }
@@ -720,7 +821,16 @@ void GetMemoryAddresses()
 
 void Init()
 {
+    if (!SAVersionGuard::Supported()) {
+        OutputDebugStringA("Project2DFX: Unsupported GTA SA executable; not installing address-based hooks.\n");
+        MessageBoxA(nullptr,
+            "Project2DFX Zeneric requires the GTA San Andreas PC 1.0 US "
+            "address layout. Hooks have not been installed to avoid a crash.",
+            "Project2DFX - Unsupported GTA SA executable", MB_OK | MB_ICONWARNING);
+        return;
+    }
     ReadIniSettings();
+    g_modelDistanceOverrides.Load(sModelDrawDistanceOverridesFile);
     // std::clamp requires an ordered range. Bad user INI values must not
     // produce undefined behaviour in the adaptive draw-distance path.
     if (!std::isfinite(fFarClipMinMultiplier) || fFarClipMinMultiplier <= 0.0f)

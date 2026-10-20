@@ -38,7 +38,7 @@ namespace ModelPreloadPolicy
         return result;
     }
 
-    // Keep the old overload for existing tests and callers.
+    // Compatibility overload retained for existing tests and utility code.
     inline std::uint8_t ObjectCategories(int id, float originalDistance,
                                          bool isInterior) noexcept
     {

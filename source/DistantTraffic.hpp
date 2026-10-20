@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include "DistantTrafficDistribution.hpp"
 
 // Shared traffic geometry and simulation, independent of game memory layouts.
 // See re3/reVC CarCtrl::UpdateCarOnRails and CCurves: cars travel between the
@@ -174,16 +175,25 @@ namespace DistantTraffic
         // neighbour queries and movement is committed only at the end.
         std::vector<int> cellX, cellY;
         size_t densityCursor = 0;
-        static unsigned LocalLimit(const Edge& edge, const CVector& position)
+        float spatialVariation = 0.0f, spacingVariation = 0.0f;
+        unsigned LocalLimit(const Edge& edge, const CVector& position) const
         {
             if constexpr (requires { Graph::DensityAt(position); })
             {
                 // III/VC initialise zone carDensity to 10. Keep the usual
                 // eight-car neighbourhood at that density, scale quieter roads.
-                float density = (std::clamp)(Graph::DensityAt(position) / 10.0f, 0.0f, 1.0f);
-                return static_cast<unsigned>(std::ceil(8.0f * density * (edge.spawnRate + 1) / 16.0f));
+                const float rawDensity = Graph::DensityAt(position);
+                const float density = std::isfinite(rawDensity) ?
+                    (std::clamp)(rawDensity / 10.0f, 0.0f, 1.0f) : 0.0f;
+                const auto base = static_cast<unsigned>(std::ceil(8.0f * density * (edge.spawnRate + 1) / 16.0f));
+                return DistantTrafficDistribution::LocalLimit(base, position.x, position.y, spatialVariation);
             }
-            return 8;
+            // SA exposes native spawn probabilities per road link. Use these
+            // only with the new mode, so 0 restores the original behavior.
+            const unsigned roadLimit = spatialVariation > 0.0f ?
+                4u + (std::min)(edge.spawnRate, 15u) * 4u / 15u : 8u;
+            return DistantTrafficDistribution::LocalLimit(
+                roadLimit, position.x, position.y, spatialVariation);
         }
         void ThinLocalTraffic()
         {
@@ -197,6 +207,7 @@ namespace DistantTraffic
                     auto& car = cars[i];
                     if (!car.m_bActive || car.retiring || car.m_bWaterNode) continue;
                     unsigned limit = LocalLimit(car.entry, car.m_vecPos), nearby = 0;
+                    if (!limit) { car.retiring = true; continue; }
                     const int x = cellX[i], y = cellY[i];
                     for (int dx = -2; dx <= 2; ++dx)
                         for (int dy = -2; dy <= 2; ++dy)
@@ -205,7 +216,7 @@ namespace DistantTraffic
                             for (size_t j = cells[Bucket(key)]; j != NoCar; j = nextCell[j])
                             {
                                 const auto& other = cars[j];
-                                if (cellKeys[j] != key || other.retiring || other.m_bWaterNode || other.m_nCoronaId > car.m_nCoronaId) continue;
+                                if (i == j || cellKeys[j] != key || other.retiring || other.m_bWaterNode || other.m_nCoronaId > car.m_nCoronaId) continue;
                                 CVector delta = other.m_vecPos - car.m_vecPos;
                                 if (std::abs(delta.z) < 4.0f && delta.MagnitudeSqr2D() < 80.0f * 80.0f) ++nearby;
                             }
@@ -270,7 +281,7 @@ namespace DistantTraffic
         bool Choose(Vehicle& car, const Edge& entry, Edge& next, unsigned& lane, Curve& curve, bool respectLanes = AvoidCongestion)
         {
             std::array<Edge, 16> options;
-            size_t count = Graph::Outgoing(entry.to, options);
+            size_t count = (std::min)(Graph::Outgoing(entry.to, options), options.size());
             float total = 0;
             bool chosen = false;
             CVector toViewer = avoidancePosition - entry.position;
@@ -330,7 +341,7 @@ namespace DistantTraffic
         bool AdvanceRoute(Vehicle& car)
         {
             Edge next;
-            unsigned nextLane;
+            unsigned nextLane = 0;
             Curve curve;
             if (!Choose(car, car.exit, next, nextLane, curve))
                 return false;
@@ -349,13 +360,13 @@ namespace DistantTraffic
                 if (node == InvalidNode)
                     continue;
                 std::array<Edge, 16> edges;
-                size_t count = Graph::Outgoing(node, edges);
+                size_t count = (std::min)(Graph::Outgoing(node, edges), edges.size());
                 if (!count)
                     continue;
                 Edge entry = edges[Random(car.random) % count];
                 if (entry.spawnRate < 15 && (Random(car.random) & 15u) > entry.spawnRate)
                     continue;
-                if (!Graph::SpawnAllowed(entry))
+                if (!entry.lanes || !Graph::SpawnAllowed(entry))
                     continue;
                 car.exitLane = Random(car.random) % entry.lanes;
                 Edge exit;
@@ -371,7 +382,13 @@ namespace DistantTraffic
                 bool occupied = false;
                 unsigned localLimit = entry.water ? 8 : LocalLimit(entry, position);
                 if (!entry.water && !localLimit) continue;
-                float spawnGap = entry.water ? 90.0f : (std::max)(28.0f, entry.speed * 2.0f);
+                const float spawnGap = spacingVariation > 0.0f ?
+                    DistantTrafficDistribution::TargetGap(
+                        entry.speed, entry.water, Random(car.random), spacingVariation) :
+                    (entry.water ? 90.0f : (std::max)(28.0f, entry.speed * 2.0f));
+                CVector spawnDirection = {0.0f, 1.0f, 0.0f};
+                if (spacingVariation > 0.0f)
+                    spawnDirection = curve.Direction(curve.Parameter(distance));
                 unsigned nearby = 0;
                 float radius = (std::max)(80.0f, spawnGap);
                 int minX = static_cast<int>(std::floor((position.x - radius) / 40.0f));
@@ -403,7 +420,12 @@ namespace DistantTraffic
                                     break;
                                 }
                             }
-                            if (spacing < spawnGap * spawnGap || (!entry.water && nearby >= localLimit))
+                            const bool blocked = spacingVariation > 0.0f ?
+                                DistantTrafficDistribution::BlocksSpawn(delta.x, delta.y, delta.z,
+                                    spawnDirection.x, spawnDirection.y,
+                                    other.m_vecDir.x, other.m_vecDir.y, spawnGap, entry.water) :
+                                spacing < spawnGap * spawnGap;
+                            if (blocked || (!entry.water && nearby >= localLimit))
                             {
                                 occupied = true;
                                 break;
@@ -907,7 +929,18 @@ namespace DistantTraffic
         CVector RenderDirection(const Vehicle& car) const
         {
             float t = (std::clamp)(accumulator * 30.0f, 0.0f, 1.0f);
-            CVector direction = car.previousDirection + (car.m_vecDir - car.previousDirection) * t;
+            CVector direction = car.previousDirection +
+                (car.m_vecDir - car.previousDirection) * t;
+            // Opposing headings can cancel at a junction (especially t=0.5).
+            // Never normalize a zero/non-finite vector into invalid RW geometry.
+            auto usable = [](const CVector& v) {
+                return std::isfinite(v.x) && std::isfinite(v.y) &&
+                    std::isfinite(v.z) && v.MagnitudeSqr() > 1.0e-8f;
+            };
+            if (!usable(direction))
+                direction = usable(car.m_vecDir) ? car.m_vecDir :
+                    (usable(car.previousDirection) ? car.previousDirection :
+                        CVector(0.0f, 1.0f, 0.0f));
             direction.Normalise();
             return direction;
         }
@@ -939,6 +972,11 @@ namespace DistantTraffic
                 buckets *= 2;
             cells.reserve(buckets);
         }
+        void SetSpawnVariation(float spatial, float spacing)
+        {
+            spatialVariation = DistantTrafficDistribution::Clamp01(spatial);
+            spacingVariation = DistantTrafficDistribution::Clamp01(spacing);
+        }
         void Clear()
         {
             for (auto& car : cars)
@@ -953,6 +991,8 @@ namespace DistantTraffic
         {
             avoidancePosition = camera;
             avoidViewer = true;
+            if (!std::isfinite(density)) density = 0.0f;
+            if (!std::isfinite(farClip) || farClip <= 0.0f) farClip = 0.0f;
             capacity = (std::min)(capacity, size_t(10000));
             if (capacity < cars.size())
                 for (size_t i = capacity; i < cars.size(); ++i)

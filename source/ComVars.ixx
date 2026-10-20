@@ -138,6 +138,8 @@ export
     bool bPreloadNeonModels = false, bPreloadBigBuildingModels = false;
     bool bPreloadAnimatedModels = false, bPreloadAllLODModels = false;
     int iPreloadMaxModels = 128, iPreloadBatchSize = 16;
+    int iPreloadMemoryBudgetMB = 32, iPreloadMinFreeMB = 24;
+    std::string sModelDrawDistanceOverridesFile;
     float fDrawDistance;
     bool bRandomExplosionEffects, bReplaceSmokeTrailWithBulletTrail;
     float fStaticSunSize;
@@ -162,6 +164,29 @@ export
     bool bGtaSaGpuCars = false;
     bool bGtaSaGpuLightQuads = false;
     float fDistantCarsGroundOffset = 0.0f;
+#ifdef PROJECT2DFX_SA
+    bool bSaLODTransitionAssist = false;
+    float fSaLODTransitionDistance = 80.0f;
+    bool bSaDistantVehicleVariety = false;
+    bool bSaWeatherIntegration = false;
+    bool bSaTrafficProfiles = false;
+    float fSaRushHourTrafficMultiplier = 1.25f;
+    float fSaNightTrafficMultiplier = 0.65f;
+    bool bSaDistanceQuality = false;
+    bool bSaNightVehicleLightsOnly = true;
+    bool bSaProjectedVehicleLights = false;
+    float fSaProjectedLightsDistance = 420.0f;
+    int nSaProjectedLightsMaxCars = 8;
+    int nSaProjectedLightsUpdatesPerFrame = 2;
+    float fSaTrafficSpatialVariation = 0.85f;
+    float fSaTrafficSpacingVariation = 0.90f;
+    bool bSaTrafficFogFade = true;
+    float fSaTrafficHeavyFogVisibility = 650.0f;
+    float fSaTrafficMaxVisibility = 1250.0f;
+    float fSaTrafficMediumDistance = 350.0f;
+    float fSaTrafficFarDistance = 700.0f;
+    float fSaTrafficTransitionBand = 40.0f;
+#endif
 
     void ReadIniSettings()
     {
@@ -189,6 +214,56 @@ export
         fDistantCarsGroundOffset = iniReader.ReadFloat("LodLights", "DistantCarsGroundOffset", 0.0f);
         bGtaSaGpuCars = iniReader.ReadInteger("LodLights", "GpuDistantCars", 0) != 0;
         bGtaSaGpuLightQuads = iniReader.ReadInteger("LodLights", "GpuLightQuads", 0) != 0;
+#ifdef PROJECT2DFX_SA
+        bSaLODTransitionAssist = iniReader.ReadInteger("LodLights", "SeamlessLODTransitions", 0) != 0;
+        fSaLODTransitionDistance = iniReader.ReadFloat("LodLights", "LODTransitionDistance", 80.0f);
+        bSaDistantVehicleVariety = iniReader.ReadInteger("LodLights", "DistantVehicleVariety", 0) != 0;
+        bSaWeatherIntegration = iniReader.ReadInteger("LodLights", "SkyGFXWeatherIntegration", 0) != 0;
+        bSaTrafficProfiles = iniReader.ReadInteger("LodLights", "DynamicTrafficProfiles", 0) != 0;
+        fSaRushHourTrafficMultiplier = iniReader.ReadFloat("LodLights", "RushHourTrafficMultiplier", 1.25f);
+        fSaNightTrafficMultiplier = iniReader.ReadFloat("LodLights", "NightTrafficMultiplier", 0.65f);
+        bSaDistanceQuality = iniReader.ReadInteger("LodLights", "DistanceBasedQuality", 0) != 0;
+        bSaNightVehicleLightsOnly = iniReader.ReadInteger("LodLights", "DistantVehicleNightLightsOnly", 1) != 0;
+        bSaProjectedVehicleLights = iniReader.ReadInteger("LodLights", "DistantVehicleProjectedLights", 0) != 0;
+        fSaProjectedLightsDistance = iniReader.ReadFloat("LodLights", "DistantVehicleProjectedLightsDistance", 420.0f);
+        nSaProjectedLightsMaxCars = iniReader.ReadInteger("LodLights", "DistantVehicleProjectedLightsMaxCars", 8);
+        nSaProjectedLightsUpdatesPerFrame = iniReader.ReadInteger("LodLights", "DistantVehicleProjectedLightsUpdatesPerFrame", 2);
+        fSaTrafficSpatialVariation = iniReader.ReadFloat("LodLights", "DistantTrafficClusterVariation", 0.85f);
+        fSaTrafficSpacingVariation = iniReader.ReadFloat("LodLights", "DistantTrafficSpacingVariation", 0.90f);
+        bSaTrafficFogFade = iniReader.ReadInteger("LodLights", "DistantTrafficFogFade", 1) != 0;
+        fSaTrafficHeavyFogVisibility = iniReader.ReadFloat("LodLights", "DistantTrafficHeavyFogDistance", 650.0f);
+        fSaTrafficMaxVisibility = iniReader.ReadFloat("LodLights", "DistantTrafficMaxVisibility", 1250.0f);
+        fSaTrafficMediumDistance = iniReader.ReadFloat("LodLights", "TrafficHighDetailDistance", 350.0f);
+        fSaTrafficFarDistance = iniReader.ReadFloat("LodLights", "TrafficMediumDetailDistance", 700.0f);
+        fSaTrafficTransitionBand = iniReader.ReadFloat("LodLights", "TrafficDetailTransitionBand", 40.0f);
+        if (!std::isfinite(fSaProjectedLightsDistance)) fSaProjectedLightsDistance = 420.0f;
+        fSaProjectedLightsDistance = (std::clamp)(fSaProjectedLightsDistance, 160.0f, 580.0f);
+        nSaProjectedLightsMaxCars = (std::clamp)(nSaProjectedLightsMaxCars, 0, 24);
+        nSaProjectedLightsUpdatesPerFrame = (std::clamp)(nSaProjectedLightsUpdatesPerFrame, 0, 6);
+        if (!std::isfinite(fSaTrafficSpatialVariation)) fSaTrafficSpatialVariation = 0.85f;
+        if (!std::isfinite(fSaTrafficSpacingVariation)) fSaTrafficSpacingVariation = 0.90f;
+        if (!std::isfinite(fSaTrafficHeavyFogVisibility)) fSaTrafficHeavyFogVisibility = 650.0f;
+        if (!std::isfinite(fSaTrafficMaxVisibility)) fSaTrafficMaxVisibility = 1250.0f;
+        fSaTrafficSpatialVariation = (std::clamp)(fSaTrafficSpatialVariation, 0.0f, 1.0f);
+        fSaTrafficSpacingVariation = (std::clamp)(fSaTrafficSpacingVariation, 0.0f, 1.0f);
+        fSaTrafficHeavyFogVisibility = (std::clamp)(fSaTrafficHeavyFogVisibility, 200.0f, 2500.0f);
+        if (fSaTrafficMaxVisibility > 0.0f)
+            fSaTrafficMaxVisibility = (std::clamp)(fSaTrafficMaxVisibility, 300.0f, 10000.0f);
+        if (!std::isfinite(fSaLODTransitionDistance)) fSaLODTransitionDistance = 80.0f;
+        fSaLODTransitionDistance = (std::clamp)(fSaLODTransitionDistance, 10.0f, 500.0f);
+        if (!std::isfinite(fSaRushHourTrafficMultiplier)) fSaRushHourTrafficMultiplier = 1.25f;
+        if (!std::isfinite(fSaNightTrafficMultiplier)) fSaNightTrafficMultiplier = 0.65f;
+        fSaRushHourTrafficMultiplier = (std::clamp)(fSaRushHourTrafficMultiplier, 0.0f, 3.0f);
+        fSaNightTrafficMultiplier = (std::clamp)(fSaNightTrafficMultiplier, 0.0f, 2.0f);
+        if (!std::isfinite(fSaTrafficMediumDistance)) fSaTrafficMediumDistance = 350.0f;
+        fSaTrafficMediumDistance = (std::clamp)(fSaTrafficMediumDistance, 150.0f, 5000.0f);
+        if (!std::isfinite(fSaTrafficFarDistance)) fSaTrafficFarDistance = 700.0f;
+        fSaTrafficFarDistance = (std::clamp)(fSaTrafficFarDistance,
+            fSaTrafficMediumDistance + 40.0f, 10000.0f);
+        if (!std::isfinite(fSaTrafficTransitionBand)) fSaTrafficTransitionBand = 40.0f;
+        fSaTrafficTransitionBand = (std::clamp)(fSaTrafficTransitionBand, 5.0f, 200.0f);
+#endif
+
         if (!std::isfinite(fDistantCarsGroundOffset)) fDistantCarsGroundOffset = 0.0f;
         fDistantCarsGroundOffset = (std::clamp)(fDistantCarsGroundOffset, -2.0f, 2.0f);
 
@@ -239,6 +314,10 @@ export
         bPreloadAllLODModels = iniReader.ReadInteger("IDETweaker", "PreloadAllLODModels", 0) != 0;
         iPreloadMaxModels = iniReader.ReadInteger("IDETweaker", "PreloadMaxModels", 128);
         iPreloadBatchSize = iniReader.ReadInteger("IDETweaker", "PreloadBatchSize", 16);
+        iPreloadMemoryBudgetMB = iniReader.ReadInteger("IDETweaker", "PreloadMemoryBudgetMB", 32);
+        iPreloadMinFreeMB = iniReader.ReadInteger("IDETweaker", "PreloadMinFreeMB", 24);
+        sModelDrawDistanceOverridesFile = iniReader.ReadString(
+            "IDETweaker", "ModelDrawDistanceOverridesFile", "");
 
         // Misc section
         bRandomExplosionEffects = iniReader.ReadInteger("Misc", "RandomExplosionEffects", 0) != 0;
