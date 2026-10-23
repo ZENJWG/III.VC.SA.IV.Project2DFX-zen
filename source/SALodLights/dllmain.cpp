@@ -706,7 +706,10 @@ void ApplyMemoryPatches()
             injector::WriteMemory(0x554FE0 + 0x382 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             injector::WriteMemory(0x554FE0 + 0x39A + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             injector::WriteMemory(0x554FE0 + 0x3A8 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
-            injector::WriteMemory(0x5B51E0 + 0x09A + 0x2, &fMaxDrawDistanceForNormalObjects, true);
+            // Not 0x5B51E0 + 0x09A (or 0x5B3040 + 0x58): those compare against 300 while IPLs are
+            // linked, to decide which entities become big buildings. With the raised threshold,
+            // standalone LODs (no parent, no children, IDE distance 600-800) load as normal objects,
+            // are only found by the near-sector scan, and leave holes in the map when seen from afar.
             injector::WriteMemory(0x554230 + 0x3B6 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             injector::WriteMemory(0x554230 + 0x3D0 + 0x2, &fMaxDrawDistanceForNormalObjects, true);
             
