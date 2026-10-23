@@ -568,7 +568,9 @@ void ApplyMemoryPatches()
             CMovingThings::RenderDistantCarImpostors();
     });
 
-    pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 6A ? 50 B9");
+    // Entry of CCoronas::Render (0x6FAEC0) rather than its call site in RenderEffects (0x53E184): renderers that replace
+    // RenderEffects with their own effects pass, such as RenderHook, still call CCoronas::Render.
+    pattern = hook::pattern("81 EC B8 00 00 00 A1 ? ? ? ? 8B 48 60");
     static auto CMovingThingsRenderHook = safetyhook::create_mid(pattern.get_first(), [](SafetyHookContext& regs)
     {
         if (bRenderLodLights)
